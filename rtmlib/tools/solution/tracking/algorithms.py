@@ -53,7 +53,7 @@ def compute_iou_matrix(
     bboxes_prev: List[np.ndarray],
     bboxes_curr: List[np.ndarray]
 ) -> np.ndarray:
-    """Compute IoU matrix between two sets of bounding boxes.
+    """Compute IoU matrix between two sets of bounding boxes (vectorized).
 
     Args:
         bboxes_prev: List of bboxes from previous frame
@@ -68,20 +68,40 @@ def compute_iou_matrix(
     if n_prev == 0 or n_curr == 0:
         return np.zeros((n_prev, n_curr), dtype=np.float32)
 
-    iou_matrix = np.zeros((n_prev, n_curr), dtype=np.float32)
+    # Convert to arrays for vectorized computation
+    prev = np.array(bboxes_prev, dtype=np.float32)  # (M, 4)
+    curr = np.array(bboxes_curr, dtype=np.float32)  # (N, 4)
 
-    for i, bbox_prev in enumerate(bboxes_prev):
-        for j, bbox_curr in enumerate(bboxes_curr):
-            iou_matrix[i, j] = compute_iou(bbox_prev, bbox_curr)
+    # Expand dims for broadcasting: prev (M,1,4), curr (1,N,4)
+    prev_exp = prev[:, np.newaxis, :]  # (M, 1, 4)
+    curr_exp = curr[np.newaxis, :, :]  # (1, N, 4)
 
-    return iou_matrix
+    # Intersection coordinates
+    x1 = np.maximum(prev_exp[..., 0], curr_exp[..., 0])
+    y1 = np.maximum(prev_exp[..., 1], curr_exp[..., 1])
+    x2 = np.minimum(prev_exp[..., 2], curr_exp[..., 2])
+    y2 = np.minimum(prev_exp[..., 3], curr_exp[..., 3])
+
+    # Intersection area
+    inter = np.maximum(0, x2 - x1) * np.maximum(0, y2 - y1)
+
+    # Individual areas
+    area_prev = (prev[:, 2] - prev[:, 0]) * (prev[:, 3] - prev[:, 1])
+    area_curr = (curr[:, 2] - curr[:, 0]) * (curr[:, 3] - curr[:, 1])
+
+    # Union
+    union = area_prev[:, np.newaxis] + area_curr[np.newaxis, :] - inter
+
+    # IoU with division safety
+    iou = np.where(union > 0, inter / union, 0)
+    return iou.astype(np.float32)
 
 
 def compute_distance_matrix(
     bboxes_prev: List[np.ndarray],
     bboxes_curr: List[np.ndarray]
 ) -> np.ndarray:
-    """Compute Euclidean distance matrix between bbox centers.
+    """Compute Euclidean distance matrix between bbox centers (vectorized).
 
     Args:
         bboxes_prev: List of bboxes from previous frame
@@ -96,21 +116,27 @@ def compute_distance_matrix(
     if n_prev == 0 or n_curr == 0:
         return np.zeros((n_prev, n_curr), dtype=np.float32)
 
-    dist_matrix = np.zeros((n_prev, n_curr), dtype=np.float32)
+    # Convert to arrays
+    prev = np.array(bboxes_prev, dtype=np.float32)  # (M, 4)
+    curr = np.array(bboxes_curr, dtype=np.float32)  # (N, 4)
 
-    for i, bbox_prev in enumerate(bboxes_prev):
-        center_prev = np.array([
-            (bbox_prev[0] + bbox_prev[2]) / 2,
-            (bbox_prev[1] + bbox_prev[3]) / 2
-        ])
-        for j, bbox_curr in enumerate(bboxes_curr):
-            center_curr = np.array([
-                (bbox_curr[0] + bbox_curr[2]) / 2,
-                (bbox_curr[1] + bbox_curr[3]) / 2
-            ])
-            dist_matrix[i, j] = np.linalg.norm(center_curr - center_prev)
+    # Compute centers vectorized
+    centers_prev = np.stack([
+        (prev[:, 0] + prev[:, 2]) / 2,
+        (prev[:, 1] + prev[:, 3]) / 2
+    ], axis=1)  # (M, 2)
 
-    return dist_matrix
+    centers_curr = np.stack([
+        (curr[:, 0] + curr[:, 2]) / 2,
+        (curr[:, 1] + curr[:, 3]) / 2
+    ], axis=1)  # (N, 2)
+
+    # Compute pairwise distances using broadcasting
+    # (M, 1, 2) - (1, N, 2) = (M, N, 2)
+    diff = centers_prev[:, np.newaxis, :] - centers_curr[np.newaxis, :, :]
+    dist_matrix = np.linalg.norm(diff, axis=2)
+
+    return dist_matrix.astype(np.float32)
 
 
 def hungarian_matching(

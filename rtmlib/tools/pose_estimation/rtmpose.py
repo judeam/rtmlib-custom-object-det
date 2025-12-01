@@ -20,25 +20,99 @@ class RTMPose(BaseTool):
         super().__init__(onnx_model, model_input_size, mean, std, backend,
                          device)
         self.to_openpose = to_openpose
+        # Pre-compute normalization arrays for faster preprocessing
+        if mean is not None:
+            self._mean_arr = np.array(mean, dtype=np.float32)
+            self._std_arr = np.array(std, dtype=np.float32)
+        else:
+            self._mean_arr = None
+            self._std_arr = None
 
     def __call__(self, image: np.ndarray, bboxes: list = []):
         if len(bboxes) == 0:
             bboxes = [[0, 0, image.shape[1], image.shape[0]]]
 
-        keypoints, scores = [], []
-        for bbox in bboxes:
+        n_boxes = len(bboxes)
+        if n_boxes == 0:
+            return np.array([]).reshape(0, 17, 2), np.array([]).reshape(0, 17)
+
+        # Batch preprocess all bboxes
+        h, w = self.model_input_size[1], self.model_input_size[0]
+        batch = np.zeros((n_boxes, 3, h, w), dtype=np.float32)
+        centers = np.zeros((n_boxes, 2), dtype=np.float32)
+        scales = np.zeros((n_boxes, 2), dtype=np.float32)
+
+        for i, bbox in enumerate(bboxes):
             img, center, scale = self.preprocess(image, bbox)
-            outputs = self.inference(img)
-            kpts, score = self.postprocess(outputs, center, scale)
+            batch[i] = img.transpose(2, 0, 1)
+            centers[i] = center
+            scales[i] = scale
 
-            keypoints.append(kpts)
-            scores.append(score)
+        # Single batched inference instead of per-bbox loop
+        outputs = self._batch_inference(batch)
 
-        keypoints = np.concatenate(keypoints, axis=0)
-        scores = np.concatenate(scores, axis=0)
+        # Batch postprocess
+        keypoints, scores = self._batch_postprocess(outputs, centers, scales)
 
         if self.to_openpose:
             keypoints, scores = convert_coco_to_openpose(keypoints, scores)
+
+        return keypoints, scores
+
+    def _batch_inference(self, batch: np.ndarray):
+        """Run inference on entire batch at once.
+
+        Args:
+            batch: Batched input images of shape (N, 3, H, W)
+
+        Returns:
+            Model outputs (batched)
+        """
+        batch = np.ascontiguousarray(batch, dtype=np.float32)
+
+        if self.backend == 'opencv':
+            outNames = self.session.getUnconnectedOutLayersNames()
+            self.session.setInput(batch)
+            outputs = self.session.forward(outNames)
+        elif self.backend == 'onnxruntime':
+            sess_input = {self.session.get_inputs()[0].name: batch}
+            sess_output = [out.name for out in self.session.get_outputs()]
+            outputs = self.session.run(sess_output, sess_input)
+        elif self.backend == 'openvino':
+            results = self.compiled_model(batch)
+            output0 = results[self.output_layer0]
+            output1 = results[self.output_layer1]
+            outputs = [output0, output1]
+
+        return outputs
+
+    def _batch_postprocess(
+            self,
+            outputs: List[np.ndarray],
+            centers: np.ndarray,
+            scales: np.ndarray,
+            simcc_split_ratio: float = 2.0) -> Tuple[np.ndarray, np.ndarray]:
+        """Postprocess batched RTMPose model output.
+
+        Args:
+            outputs: Batched model outputs [simcc_x, simcc_y]
+            centers: Batch centers of shape (N, 2)
+            scales: Batch scales of shape (N, 2)
+            simcc_split_ratio: Split ratio of simcc
+
+        Returns:
+            keypoints: Batched keypoints of shape (N, K, 2)
+            scores: Batched scores of shape (N, K)
+        """
+        # Decode simcc (already batched from model)
+        simcc_x, simcc_y = outputs  # (N, K, Wx), (N, K, Wy)
+        locs, scores = get_simcc_maximum(simcc_x, simcc_y)  # Handles batch
+        keypoints = locs / simcc_split_ratio  # (N, K, 2)
+
+        # Vectorized rescaling: (N, K, 2) * (N, 1, 2) / (2,) + (N, 1, 2) - (N, 1, 2) / 2
+        model_size = np.array(self.model_input_size, dtype=np.float32)
+        keypoints = keypoints / model_size * scales[:, np.newaxis, :]
+        keypoints = keypoints + centers[:, np.newaxis, :] - scales[:, np.newaxis, :] / 2
 
         return keypoints, scores
 
@@ -63,11 +137,9 @@ class RTMPose(BaseTool):
         # do affine transformation
         resized_img, scale = top_down_affine(self.model_input_size, scale,
                                              center, img)
-        # normalize image
-        if self.mean is not None:
-            self.mean = np.array(self.mean)
-            self.std = np.array(self.std)
-            resized_img = (resized_img - self.mean) / self.std
+        # normalize image (using pre-computed arrays)
+        if self._mean_arr is not None:
+            resized_img = (resized_img - self._mean_arr) / self._std_arr
 
         return resized_img, center, scale
 

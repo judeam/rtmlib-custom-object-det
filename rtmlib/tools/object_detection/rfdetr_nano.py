@@ -296,6 +296,14 @@ class RFDETRNano(BaseTool):
             # Create CUDA stream
             self._stream = torch.cuda.Stream()
 
+            # CUDA Graph state for zero-overhead inference replay
+            self._cuda_graph = None
+            self._cuda_graph_warmup_done = False
+
+            # Pre-compute normalization constants (avoid allocation each inference)
+            self._norm_mean = torch.tensor([0.485, 0.456, 0.406], device="cuda").view(1, 3, 1, 1)
+            self._norm_std = torch.tensor([0.229, 0.224, 0.225], device="cuda").view(1, 3, 1, 1)
+
             print("TensorRT engine loaded successfully")
 
         except Exception as e:
@@ -416,19 +424,29 @@ class RFDETRNano(BaseTool):
                 align_corners=False,
             )
 
-        # ImageNet normalization
-        mean = torch.tensor([0.485, 0.456, 0.406], device="cuda").view(1, 3, 1, 1)
-        std = torch.tensor([0.229, 0.224, 0.225], device="cuda").view(1, 3, 1, 1)
+        # ImageNet normalization (using pre-computed constants)
         img_tensor = img_tensor.mul_(1.0 / 255.0)
-        img_tensor = img_tensor.sub_(mean).div_(std)
+        img_tensor = img_tensor.sub_(self._norm_mean).div_(self._norm_std)
 
         # Copy input data
         self._input_tensors[self._input_name].copy_(img_tensor)
 
-        # Execute inference
-        with torch.cuda.stream(self._stream):
-            self._context.execute_async_v3(stream_handle=self._stream.cuda_stream)
-        torch.cuda.synchronize()
+        # Execute inference with CUDA Graph optimization
+        if not self._cuda_graph_warmup_done:
+            # First run: warmup without graph capture
+            with torch.cuda.stream(self._stream):
+                self._context.execute_async_v3(stream_handle=self._stream.cuda_stream)
+            self._stream.synchronize()
+
+            # Capture CUDA graph for subsequent runs
+            self._cuda_graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(self._cuda_graph, stream=self._stream):
+                self._context.execute_async_v3(stream_handle=self._stream.cuda_stream)
+            self._cuda_graph_warmup_done = True
+        else:
+            # Replay captured graph (zero CPU overhead)
+            self._cuda_graph.replay()
+            self._stream.synchronize()
 
         # Parse outputs using name-based lookup
         boxes = self._output_tensors[self._boxes_name]
