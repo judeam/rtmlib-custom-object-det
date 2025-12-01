@@ -23,7 +23,7 @@ RTMLIB_SETTINGS = {
     },
     'onnxruntime': {
         'cpu': 'CPUExecutionProvider',
-        'cuda': 'CUDAExecutionProvider',
+        'cuda': ['TensorrtExecutionProvider', 'CUDAExecutionProvider'],  # TRT first, fallback to CUDA
         'rocm': 'ROCMExecutionProvider',
         'mps': 'CoreMLExecutionProvider' if check_mps_support() else 'CPUExecutionProvider'
     },
@@ -62,8 +62,12 @@ class BaseTool(metaclass=ABCMeta):
             import onnxruntime as ort
             providers = RTMLIB_SETTINGS[backend][device]
 
+            # Handle both single provider (string) and multiple providers (list)
+            if isinstance(providers, str):
+                providers = [providers]
+
             self.session = ort.InferenceSession(path_or_bytes=onnx_model,
-                                                providers=[providers])
+                                                providers=providers)
 
         elif backend == 'openvino':
             from openvino.runtime import Core
