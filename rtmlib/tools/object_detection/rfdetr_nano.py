@@ -52,6 +52,7 @@ class RFDETRNano(BaseTool):
             model_path = self._resolve_model_path()
 
         self.model_path = model_path
+        print(f"[RFDETRNano] Model path: {self.model_path}")
 
         # Initialize model based on backend
         if backend in ('onnxruntime', 'tensorrt') and device == 'cuda':
@@ -79,8 +80,9 @@ class RFDETRNano(BaseTool):
         tools_models_path = os.path.abspath(tools_models_path)
 
         # Try relative to project root (for development)
+        # current_dir is rtmlib/tools/object_detection/, so 3 levels up is project root
         project_root = os.path.dirname(
-            os.path.dirname(os.path.dirname(os.path.dirname(current_dir)))
+            os.path.dirname(os.path.dirname(current_dir))
         )
         dev_model_path = os.path.join(project_root, 'models', 'rfdetr_nano_person.pt')
 
@@ -124,6 +126,9 @@ class RFDETRNano(BaseTool):
         engine_name = f"{model_stem}_{size_str}_cuda_{precision_str}.engine"
         engine_path = str(Path(self.model_path).parent / engine_name)
 
+        print(f"[RFDETRNano] Checking for engine at: {engine_path}")
+        print(f"[RFDETRNano] Engine exists: {os.path.exists(engine_path)}")
+
         # Check if engine already exists
         if os.path.exists(engine_path):
             print(f"TensorRT engine already exists: {engine_path}")
@@ -158,6 +163,9 @@ class RFDETRNano(BaseTool):
 
             print(f"Exporting to ONNX: {onnx_path}")
 
+            # Remember current working directory
+            cwd = os.getcwd()
+
             # Use RF-DETR's built-in export method
             # dynamic=False is critical for TensorRT CUDA Graphs
             self.model.export(
@@ -166,16 +174,24 @@ class RFDETRNano(BaseTool):
                 dynamic=False,
             )
 
-            # RF-DETR may export to a different path, handle this
+            # RF-DETR exports to 'output/inference_model.onnx' relative to cwd
+            # regardless of output_path parameter
             if not os.path.exists(onnx_path):
-                # Check common RF-DETR export locations
+                # Check common RF-DETR export locations (relative to cwd)
                 possible_paths = [
+                    os.path.join(cwd, "output", "inference_model.onnx"),
+                    os.path.join(cwd, "inference_model.onnx"),
                     "output/inference_model.onnx",
                     "inference_model.onnx",
                 ]
                 for possible_path in possible_paths:
                     if os.path.exists(possible_path):
+                        print(f"Found exported ONNX at: {possible_path}, moving to: {onnx_path}")
                         shutil.move(possible_path, onnx_path)
+                        # Clean up empty output directory if created
+                        output_dir = os.path.dirname(possible_path)
+                        if os.path.isdir(output_dir) and not os.listdir(output_dir):
+                            os.rmdir(output_dir)
                         break
 
             if os.path.exists(onnx_path):
@@ -183,10 +199,13 @@ class RFDETRNano(BaseTool):
                 return onnx_path
             else:
                 print("ONNX export failed - output file not found")
+                print(f"Checked: {possible_paths}")
                 return None
 
         except Exception as e:
             print(f"Failed to export to ONNX: {e}")
+            import traceback
+            traceback.print_exc()
             return None
 
     def _build_tensorrt_engine(self, onnx_path: str, engine_path: str) -> Optional[str]:
@@ -423,14 +442,6 @@ class RFDETRNano(BaseTool):
         """Postprocess TensorRT outputs."""
         import torch
 
-        # Debug: Print shapes on first call
-        if not hasattr(self, '_debug_printed'):
-            print(f"[DEBUG] boxes shape: {boxes.shape}, scores shape: {scores.shape if scores is not None else None}")
-            print(f"[DEBUG] boxes sample: {boxes[0, :3, :]}")
-            if scores is not None:
-                print(f"[DEBUG] scores sample (pre-sigmoid): {scores[0, :3, :]}")
-            self._debug_printed = True
-
         # Apply sigmoid to scores
         if scores is not None:
             scores = torch.sigmoid(scores)
@@ -438,15 +449,6 @@ class RFDETRNano(BaseTool):
             max_scores, class_ids = scores.max(dim=2)
             max_scores = max_scores[0]  # Remove batch dimension
             class_ids = class_ids[0]
-
-            # Debug: Print score stats on first call
-            if not hasattr(self, '_debug_scores_printed'):
-                top_scores, top_indices = max_scores.topk(min(10, len(max_scores)))
-                top_classes = class_ids[top_indices]
-                print(f"[DEBUG] Top 10 scores (post-sigmoid): {top_scores.cpu().numpy()}")
-                print(f"[DEBUG] Top 10 class IDs: {top_classes.cpu().numpy()}")
-                print(f"[DEBUG] Score threshold: {self.score_thr}, Person class: {self.PERSON_CLASS}")
-                self._debug_scores_printed = True
         else:
             max_scores = torch.ones(boxes.shape[1], device="cuda")
             class_ids = torch.zeros(boxes.shape[1], device="cuda", dtype=torch.int64)
