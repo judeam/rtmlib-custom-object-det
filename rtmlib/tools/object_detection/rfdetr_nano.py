@@ -17,7 +17,7 @@ class RFDETRNano(BaseTool):
     format on first use for optimal inference performance.
     """
 
-    PERSON_CLASS = 0  # Person class in the fine-tuned model (no background class)
+    PERSON_CLASS = 5  # Person class in the fine-tuned model (class 5 based on debug output)
 
     def __init__(
         self,
