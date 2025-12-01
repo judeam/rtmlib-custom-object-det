@@ -46,22 +46,22 @@ import numpy as np
 class Body:
     MODE = {
         'performance': {
-            'det': None,  # Use YOLO12n default model
-            'det_input_size': (640, 640),
+            'det': None,  # Use RFDETRNano default model
+            'det_input_size': (384, 384),
             'pose':
             'https://download.openmmlab.com/mmpose/v1/projects/rtmposev1/onnx_sdk/rtmpose-x_simcc-body7_pt-body7_700e-384x288-71d7b7e9_20230629.zip',  # noqa
             'pose_input_size': (288, 384),
         },
         'lightweight': {
-            'det': None,  # Use YOLO12n default model
-            'det_input_size': (416, 416),
+            'det': None,  # Use RFDETRNano default model
+            'det_input_size': (384, 384),
             'pose':
             'https://download.openmmlab.com/mmpose/v1/projects/rtmposev1/onnx_sdk/rtmpose-s_simcc-body7_pt-body7_420e-256x192-acd4a1ef_20230504.zip',  # noqa
             'pose_input_size': (192, 256),
         },
         'balanced': {
-            'det': None,  # Use YOLO12n default model
-            'det_input_size': (640, 640),
+            'det': None,  # Use RFDETRNano default model
+            'det_input_size': (384, 384),
             'pose':
             'https://download.openmmlab.com/mmpose/v1/projects/rtmposev1/onnx_sdk/rtmpose-m_simcc-body7_pt-body7_420e-256x192-e48f03d0_20230504.zip',  # noqa
             'pose_input_size': (192, 256),
@@ -110,7 +110,7 @@ class Body:
                                    backend=backend,
                                    device=device)
         else:
-            from .. import YOLO12n, RTMPose
+            from .. import RFDETRNano, RTMPose
 
             self.one_stage = False
 
@@ -122,12 +122,12 @@ class Body:
                 det = self.MODE[mode]['det']
                 det_input_size = self.MODE[mode]['det_input_size']
 
-            self.det_model = YOLO12n(model_path=det,
-                                     model_input_size=det_input_size,
-                                     score_thr=det_score_thr,
-                                     backend=backend,
-                                     device=device,
-                                     export_format='engine')
+            self.det_model = RFDETRNano(model_path=det,
+                                        model_input_size=det_input_size,
+                                        score_thr=det_score_thr,
+                                        backend=backend,
+                                        device=device,
+                                        export_format='engine')
             self.pose_model = RTMPose(pose,
                                       model_input_size=pose_input_size,
                                       to_openpose=to_openpose,

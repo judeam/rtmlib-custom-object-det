@@ -5,4 +5,4 @@ opencv-python
 tqdm
 supervision
 torch
-ultralytics
+rfdetr

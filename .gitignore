@@ -111,7 +111,11 @@ venv.bak/
 *.onnx
 *.mp4
 
-# Pytorch
+# Pytorch / Model files
 *.pth
+*.pt
+*.engine
+models/*.pt
+models/*.engine
 
 *.DS_Store

@@ -11,15 +11,13 @@ version_file = 'rtmlib/version.py'
 
 
 def get_version():
+    import re
     with open(version_file, 'r') as f:
-        exec(compile(f.read(), version_file, 'exec'))
-    import sys
-
-    # return short version for sdist
-    if 'sdist' in sys.argv or 'bdist_wheel' in sys.argv:
-        return locals()['short_version']
-    else:
-        return locals()['__version__']
+        content = f.read()
+    version_match = re.search(r"^__version__\s*=\s*['\"]([^'\"]*)['\"]", content, re.M)
+    if version_match:
+        return version_match.group(1)
+    raise RuntimeError("Unable to find version string.")
 
 
 def parse_requirements(fname='requirements.txt', with_version=True):

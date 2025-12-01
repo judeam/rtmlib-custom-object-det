@@ -14,9 +14,9 @@ openpose_skeleton = False  # True for openpose-style, False for mmpose-style
 
 # Example: BodyWithFeet in balanced mode
 custom = Custom(to_openpose=openpose_skeleton,
-                det_class='YOLO12n',
-                det=None,  # Uses models/person_detector_yolo12.pt
-                det_input_size=(640, 640),
+                det_class='RFDETRNano',
+                det=None,  # Uses models/rfdetr_nano_person.pt
+                det_input_size=(384, 384),
                 pose_class='RTMPose',
                 pose='https://download.openmmlab.com/mmpose/v1/projects/rtmposev1/onnx_sdk/rtmpose-m_simcc-body7_pt-body7-halpe26_700e-256x192-4d3e73dd_20230605.zip', # noqa
                 pose_input_size=(192, 256),
