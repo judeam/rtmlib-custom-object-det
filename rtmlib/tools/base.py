@@ -5,6 +5,14 @@ from typing import Any
 import cv2
 import numpy as np
 
+# Enable TensorRT engine caching for ONNX Runtime TensorRT EP
+# This must be set BEFORE importing onnxruntime
+_trt_cache_path = os.path.join(os.path.expanduser("~"), ".cache", "rtmlib", "trt_engines")
+os.makedirs(_trt_cache_path, exist_ok=True)
+os.environ.setdefault("ORT_TENSORRT_ENGINE_CACHE_ENABLE", "1")
+os.environ.setdefault("ORT_TENSORRT_ENGINE_CACHE_PATH", _trt_cache_path)
+os.environ.setdefault("ORT_TENSORRT_FP16_ENABLE", "1")
+
 from .file import download_checkpoint
 def check_mps_support():
     try:
@@ -23,7 +31,7 @@ RTMLIB_SETTINGS = {
     },
     'onnxruntime': {
         'cpu': 'CPUExecutionProvider',
-        'cuda': ['TensorrtExecutionProvider', 'CUDAExecutionProvider'],  # TRT first, fallback to CUDA
+        'cuda': ['TensorrtExecutionProvider', 'CUDAExecutionProvider'],
         'rocm': 'ROCMExecutionProvider',
         'mps': 'CoreMLExecutionProvider' if check_mps_support() else 'CPUExecutionProvider'
     },
@@ -66,8 +74,28 @@ class BaseTool(metaclass=ABCMeta):
             if isinstance(providers, str):
                 providers = [providers]
 
-            self.session = ort.InferenceSession(path_or_bytes=onnx_model,
-                                                providers=providers)
+            # Configure TensorRT EP with engine caching
+            provider_options = None
+            if 'TensorrtExecutionProvider' in providers:
+                trt_cache_path = os.path.join(
+                    os.path.expanduser("~"), ".cache", "rtmlib", "trt_engines"
+                )
+                os.makedirs(trt_cache_path, exist_ok=True)
+
+                provider_options = [
+                    {
+                        'trt_engine_cache_enable': True,
+                        'trt_engine_cache_path': trt_cache_path,
+                        'trt_fp16_enable': True,
+                    },
+                    {}  # Empty options for CUDAExecutionProvider fallback
+                ]
+
+            self.session = ort.InferenceSession(
+                path_or_bytes=onnx_model,
+                providers=providers,
+                provider_options=provider_options
+            )
 
         elif backend == 'openvino':
             from openvino.runtime import Core
