@@ -71,7 +71,7 @@ class BodyWithFeet:
 
     def __init__(self,
                  det: str = None,
-                 det_input_size: tuple = (640, 640),
+                 det_input_size: tuple = (384, 384),
                  det_score_thr: float = 0.5,
                  pose: str = None,
                  pose_input_size: tuple = (192, 256),
@@ -84,7 +84,7 @@ class BodyWithFeet:
 
         Args:
             det (str, optional): Path to detection model. If None, uses default based on mode.
-            det_input_size (tuple, optional): Input size for detection model. Default is (640, 640).
+            det_input_size (tuple, optional): Input size for detection model. Default is (384, 384).
             det_score_thr (float, optional): Detection confidence threshold. Default is 0.5.
             pose (str, optional): Path to pose estimation model. If None, uses default based on mode.
             pose_input_size (tuple, optional): Input size for pose model. Default is (192, 256).

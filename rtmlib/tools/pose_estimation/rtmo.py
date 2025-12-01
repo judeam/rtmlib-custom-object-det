@@ -12,7 +12,7 @@ class RTMO(BaseTool):
 
     def __init__(self,
                  onnx_model: str,
-                 model_input_size: tuple = (640, 640),
+                 model_input_size: tuple = (384, 384),
                  mean: tuple = None,
                  std: tuple = None,
                  nms_thr: float = 0.45,

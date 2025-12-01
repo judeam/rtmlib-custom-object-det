@@ -119,7 +119,7 @@ wholebody = Wholebody(mode='performance',  # 'performance', 'lightweight', 'bala
 
 # By det and pose
 body = Body(det='https://download.openmmlab.com/mmpose/v1/projects/rtmposev1/onnx_sdk/yolox_x_8xb8-300e_humanart-a39d44ed.zip',
-            det_input_size=(640, 640),
+            det_input_size=(384, 384),
             pose='https://download.openmmlab.com/mmpose/v1/projects/rtmposev1/onnx_sdk/rtmpose-x_simcc-body7_pt-body7_700e-384x288-71d7b7e9_20230629.zip',
             pose_input_size=(288, 384),
             backend=backend,
@@ -166,13 +166,13 @@ Notes:
 
 |                                                          ONNX Model                                                           | Input Size | AP (person) |       Description        |
 | :---------------------------------------------------------------------------------------------------------------------------: | :--------: | :---------: | :----------------------: |
-|                 [YOLOX-l](https://drive.google.com/file/d/1w9pXC8tT0p9ndMN-CArp1__b2GbzewWI/view?usp=sharing)                 |  640x640   |      -      |     trained on COCO      |
+|                 [YOLOX-l](https://drive.google.com/file/d/1w9pXC8tT0p9ndMN-CArp1__b2GbzewWI/view?usp=sharing)                 |  384x384   |      -      |     trained on COCO      |
 | [YOLOX-nano](https://download.openmmlab.com/mmpose/v1/projects/rtmposev1/onnx_sdk/yolox_nano_8xb8-300e_humanart-40f6f0d0.zip) |  416x416   |    38.9     | trained on HumanArt+COCO |
 | [YOLOX-tiny](https://download.openmmlab.com/mmpose/v1/projects/rtmposev1/onnx_sdk/yolox_tiny_8xb8-300e_humanart-6f3252f9.zip) |  416x416   |    47.7     | trained on HumanArt+COCO |
-|    [YOLOX-s](https://download.openmmlab.com/mmpose/v1/projects/rtmposev1/onnx_sdk/yolox_s_8xb8-300e_humanart-3ef259a7.zip)    |  640x640   |    54.6     | trained on HumanArt+COCO |
-|    [YOLOX-m](https://download.openmmlab.com/mmpose/v1/projects/rtmposev1/onnx_sdk/yolox_m_8xb8-300e_humanart-c2c7a14a.zip)    |  640x640   |    59.1     | trained on HumanArt+COCO |
-|    [YOLOX-l](https://download.openmmlab.com/mmpose/v1/projects/rtmposev1/onnx_sdk/yolox_l_8xb8-300e_humanart-ce1d7a62.zip)    |  640x640   |    60.2     | trained on HumanArt+COCO |
-|    [YOLOX-x](https://download.openmmlab.com/mmpose/v1/projects/rtmposev1/onnx_sdk/yolox_x_8xb8-300e_humanart-a39d44ed.zip)    |  640x640   |    61.3     | trained on HumanArt+COCO |
+|    [YOLOX-s](https://download.openmmlab.com/mmpose/v1/projects/rtmposev1/onnx_sdk/yolox_s_8xb8-300e_humanart-3ef259a7.zip)    |  384x384   |    54.6     | trained on HumanArt+COCO |
+|    [YOLOX-m](https://download.openmmlab.com/mmpose/v1/projects/rtmposev1/onnx_sdk/yolox_m_8xb8-300e_humanart-c2c7a14a.zip)    |  384x384   |    59.1     | trained on HumanArt+COCO |
+|    [YOLOX-l](https://download.openmmlab.com/mmpose/v1/projects/rtmposev1/onnx_sdk/yolox_l_8xb8-300e_humanart-ce1d7a62.zip)    |  384x384   |    60.2     | trained on HumanArt+COCO |
+|    [YOLOX-x](https://download.openmmlab.com/mmpose/v1/projects/rtmposev1/onnx_sdk/yolox_x_8xb8-300e_humanart-a39d44ed.zip)    |  384x384   |    61.3     | trained on HumanArt+COCO |
 
 </details>
 
@@ -189,9 +189,9 @@ Notes:
 | [RTMPose-l](https://download.openmmlab.com/mmpose/v1/projects/rtmposev1/onnx_sdk/rtmpose-l_simcc-body7_pt-body7_420e-256x192-4dba18fc_20230504.zip) |  256x192   |   76.7    | trained on 7 datasets |
 | [RTMPose-l](https://download.openmmlab.com/mmpose/v1/projects/rtmposev1/onnx_sdk/rtmpose-l_simcc-body7_pt-body7_420e-384x288-3f5a1437_20230504.zip) |  384x288   |   78.3    | trained on 7 datasets |
 | [RTMPose-x](https://download.openmmlab.com/mmpose/v1/projects/rtmposev1/onnx_sdk/rtmpose-x_simcc-body7_pt-body7_700e-384x288-71d7b7e9_20230629.zip) |  384x288   |   78.8    | trained on 7 datasets |
-|           [RTMO-s](https://download.openmmlab.com/mmpose/v1/projects/rtmo/onnx_sdk/rtmo-s_8xb32-600e_body7-640x640-dac2bf74_20231211.zip)           |  640x640   |   68.6    | trained on 7 datasets |
-|          [RTMO-m](https://download.openmmlab.com/mmpose/v1/projects/rtmo/onnx_sdk/rtmo-m_16xb16-600e_body7-640x640-39e78cc4_20231211.zip)           |  640x640   |   72.6    | trained on 7 datasets |
-|          [RTMO-l](https://download.openmmlab.com/mmpose/v1/projects/rtmo/onnx_sdk/rtmo-l_16xb16-600e_body7-640x640-b37118ce_20231211.zip)           |  640x640   |   74.8    | trained on 7 datasets |
+|           [RTMO-s](https://download.openmmlab.com/mmpose/v1/projects/rtmo/onnx_sdk/rtmo-s_8xb32-600e_body7-384x384-dac2bf74_20231211.zip)           |  384x384   |   68.6    | trained on 7 datasets |
+|          [RTMO-m](https://download.openmmlab.com/mmpose/v1/projects/rtmo/onnx_sdk/rtmo-m_16xb16-600e_body7-384x384-39e78cc4_20231211.zip)           |  384x384   |   72.6    | trained on 7 datasets |
+|          [RTMO-l](https://download.openmmlab.com/mmpose/v1/projects/rtmo/onnx_sdk/rtmo-l_16xb16-600e_body7-384x384-b37118ce_20231211.zip)           |  384x384   |   74.8    | trained on 7 datasets |
 
 </details>
 

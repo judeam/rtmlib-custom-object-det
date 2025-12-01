@@ -46,6 +46,6 @@ while cap.isOpened():
                              kpt_thr=0.3,
                              line_width=5)
 
-    img_show = cv2.resize(img_show, (960, 640))
+    img_show = cv2.resize(img_show, (960, 384))
     cv2.imshow('img', img_show)
     cv2.waitKey(10)

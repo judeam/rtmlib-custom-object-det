@@ -71,24 +71,24 @@ class Body:
     RTMO_MODE = {
         'performance': {
             'pose':
-            'https://download.openmmlab.com/mmpose/v1/projects/rtmo/onnx_sdk/rtmo-l_16xb16-600e_body7-640x640-b37118ce_20231211.zip',  # noqa
-            'pose_input_size': (640, 640),
+            'https://download.openmmlab.com/mmpose/v1/projects/rtmo/onnx_sdk/rtmo-l_16xb16-600e_body7-384x384-b37118ce_20231211.zip',  # noqa
+            'pose_input_size': (384, 384),
         },
         'lightweight': {
             'pose':
-            'https://download.openmmlab.com/mmpose/v1/projects/rtmo/onnx_sdk/rtmo-s_8xb32-600e_body7-640x640-dac2bf74_20231211.zip',  # noqa
-            'pose_input_size': (640, 640),
+            'https://download.openmmlab.com/mmpose/v1/projects/rtmo/onnx_sdk/rtmo-s_8xb32-600e_body7-384x384-dac2bf74_20231211.zip',  # noqa
+            'pose_input_size': (384, 384),
         },
         'balanced': {
             'pose':
-            'https://download.openmmlab.com/mmpose/v1/projects/rtmo/onnx_sdk/rtmo-m_16xb16-600e_body7-640x640-39e78cc4_20231211.zip',  # noqa
-            'pose_input_size': (640, 640),
+            'https://download.openmmlab.com/mmpose/v1/projects/rtmo/onnx_sdk/rtmo-m_16xb16-600e_body7-384x384-39e78cc4_20231211.zip',  # noqa
+            'pose_input_size': (384, 384),
         }
     }
 
     def __init__(self,
                  det: str = None,
-                 det_input_size: tuple = (640, 640),
+                 det_input_size: tuple = (384, 384),
                  det_score_thr: float = 0.5,
                  pose: str = None,
                  pose_input_size: tuple = (288, 384),

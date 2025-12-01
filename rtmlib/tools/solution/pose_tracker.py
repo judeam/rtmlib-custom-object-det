@@ -22,8 +22,8 @@ pose_tracker = PoseTracker(Wholebody,
 # custom = partial(Custom,
 #                 to_openpose=openpose_skeleton,
 #                 pose_class='RTMO',
-#                 pose='https://download.openmmlab.com/mmpose/v1/projects/rtmo/onnx_sdk/rtmo-m_16xb16-600e_body7-640x640-39e78cc4_20231211.zip', # noqa
-#                 pose_input_size=(640,640),
+#                 pose='https://download.openmmlab.com/mmpose/v1/projects/rtmo/onnx_sdk/rtmo-m_16xb16-600e_body7-384x384-39e78cc4_20231211.zip', # noqa
+#                 pose_input_size=(384,384),
 #                 backend=backend,
 #                 device=device)
 # # or

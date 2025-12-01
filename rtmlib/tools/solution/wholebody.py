@@ -76,7 +76,7 @@ class Wholebody:
 
     def __init__(self,
                  det: str = None,
-                 det_input_size: tuple = (640, 640),
+                 det_input_size: tuple = (384, 384),
                  det_score_thr: float = 0.5,
                  pose: str = None,
                  pose_input_size: tuple = (288, 384),

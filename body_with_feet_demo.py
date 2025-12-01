@@ -39,7 +39,7 @@ while cap.isOpened():
                              kpt_thr=0.3,
                              line_width=3)
 
-    img_show = cv2.resize(img_show, (960, 640))
+    img_show = cv2.resize(img_show, (960, 384))
     while True:
         cv2.imshow('Body and Feet Pose Estimation', img_show)
         key = cv2.waitKey(1) & 0xFF

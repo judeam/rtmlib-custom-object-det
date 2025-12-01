@@ -11,7 +11,7 @@ class RTMDet(BaseTool):
 
     def __init__(self,
                  onnx_model: str,
-                 model_input_size: tuple = (640, 640),
+                 model_input_size: tuple = (384, 384),
                  mean: tuple = (103.5300, 116.2800, 123.6750),
                  std: tuple = (57.3750, 57.1200, 58.3950),
                  backend: str = 'onnxruntime',

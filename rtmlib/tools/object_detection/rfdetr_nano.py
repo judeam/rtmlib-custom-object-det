@@ -319,9 +319,27 @@ class RFDETRNano(BaseTool):
                 self._output_tensors[name] = tensor
                 self._context.set_tensor_address(name, tensor.data_ptr())
 
-        # Store tensor names for inference
+        # Store input tensor name
         self._input_name = list(self._input_tensors.keys())[0]
-        self._output_names = list(self._output_tensors.keys())
+
+        # Find output tensors by name pattern (like reference implementation)
+        self._boxes_name = None
+        self._scores_name = None
+        for name in self._output_tensors.keys():
+            name_lower = name.lower()
+            if "det" in name_lower or "box" in name_lower:
+                self._boxes_name = name
+            elif "label" in name_lower or "score" in name_lower or "class" in name_lower:
+                self._scores_name = name
+
+        # Fallback to index order if names don't match patterns
+        output_names = list(self._output_tensors.keys())
+        if self._boxes_name is None and len(output_names) > 0:
+            self._boxes_name = output_names[0]
+        if self._scores_name is None and len(output_names) > 1:
+            self._scores_name = output_names[1]
+
+        print(f"TensorRT outputs - boxes: {self._boxes_name}, scores: {self._scores_name}")
 
     def __call__(self, image: np.ndarray) -> np.ndarray:
         """Run detection on input image.
@@ -393,10 +411,9 @@ class RFDETRNano(BaseTool):
             self._context.execute_async_v3(stream_handle=self._stream.cuda_stream)
         torch.cuda.synchronize()
 
-        # Parse outputs
-        # RF-DETR outputs: boxes (1, 300, 4) in cxcywh format, scores (1, 300, num_classes)
-        boxes = self._output_tensors[self._output_names[0]]
-        scores = self._output_tensors[self._output_names[1]] if len(self._output_names) > 1 else None
+        # Parse outputs using name-based lookup
+        boxes = self._output_tensors[self._boxes_name]
+        scores = self._output_tensors[self._scores_name] if self._scores_name else None
 
         return self._postprocess_tensorrt(boxes, scores, orig_w, orig_h)
 
@@ -406,6 +423,14 @@ class RFDETRNano(BaseTool):
         """Postprocess TensorRT outputs."""
         import torch
 
+        # Debug: Print shapes on first call
+        if not hasattr(self, '_debug_printed'):
+            print(f"[DEBUG] boxes shape: {boxes.shape}, scores shape: {scores.shape if scores is not None else None}")
+            print(f"[DEBUG] boxes sample: {boxes[0, :3, :]}")
+            if scores is not None:
+                print(f"[DEBUG] scores sample (pre-sigmoid): {scores[0, :3, :]}")
+            self._debug_printed = True
+
         # Apply sigmoid to scores
         if scores is not None:
             scores = torch.sigmoid(scores)
@@ -413,8 +438,16 @@ class RFDETRNano(BaseTool):
             max_scores, class_ids = scores.max(dim=2)
             max_scores = max_scores[0]  # Remove batch dimension
             class_ids = class_ids[0]
+
+            # Debug: Print score stats on first call
+            if not hasattr(self, '_debug_scores_printed'):
+                top_scores, top_indices = max_scores.topk(min(10, len(max_scores)))
+                top_classes = class_ids[top_indices]
+                print(f"[DEBUG] Top 10 scores (post-sigmoid): {top_scores.cpu().numpy()}")
+                print(f"[DEBUG] Top 10 class IDs: {top_classes.cpu().numpy()}")
+                print(f"[DEBUG] Score threshold: {self.score_thr}, Person class: {self.PERSON_CLASS}")
+                self._debug_scores_printed = True
         else:
-            # Single class model - use first output as both boxes and scores
             max_scores = torch.ones(boxes.shape[1], device="cuda")
             class_ids = torch.zeros(boxes.shape[1], device="cuda", dtype=torch.int64)
 
@@ -430,7 +463,7 @@ class RFDETRNano(BaseTool):
         valid_boxes = boxes[valid_mask]
         cx, cy, w, h = valid_boxes[:, 0], valid_boxes[:, 1], valid_boxes[:, 2], valid_boxes[:, 3]
 
-        # Scale to original image size
+        # Scale to original image size (coordinates are normalized 0-1)
         x1 = (cx - w / 2) * orig_w
         y1 = (cy - h / 2) * orig_h
         x2 = (cx + w / 2) * orig_w
