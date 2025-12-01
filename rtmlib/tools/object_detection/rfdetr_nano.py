@@ -45,7 +45,7 @@ class RFDETRNano(BaseTool):
         self.export_format = export_format
         self.model = None
         self.engine_path = None
-        self._trt_engine = None
+        self._engine = None
 
         # Resolve model path
         if model_path is None:
@@ -281,7 +281,7 @@ class RFDETRNano(BaseTool):
 
         except Exception as e:
             print(f"Failed to load TensorRT engine: {e}")
-            self._trt_engine = None
+            self._engine = None
             # Fallback to PyTorch
             self.backend = 'pytorch'
             self._load_pytorch_model()
@@ -332,7 +332,7 @@ class RFDETRNano(BaseTool):
         Returns:
             Filtered bounding boxes for person class in format [[x1, y1, x2, y2], ...].
         """
-        if self.backend == 'pytorch' or self._trt_engine is None:
+        if self.backend == 'pytorch' or self._engine is None:
             return self._inference_pytorch(image)
         else:
             return self._inference_tensorrt(image)
