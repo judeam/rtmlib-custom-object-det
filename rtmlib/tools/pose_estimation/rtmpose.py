@@ -15,7 +15,14 @@ class RTMPose(BaseTool):
 
     When device='cuda', automatically builds and uses a TensorRT engine
     with GPU preprocessing for optimal performance.
+
+    Supports batch processing for multiple people detection - significantly
+    faster than sequential processing when 2+ people are detected.
     """
+
+    # Pre-allocated empty results for zero-detection frames
+    _EMPTY_KEYPOINTS = np.zeros((0, 17, 2), dtype=np.float32)
+    _EMPTY_SCORES = np.zeros((0, 17), dtype=np.float32)
 
     def __init__(self,
                  onnx_model: str,
@@ -24,7 +31,13 @@ class RTMPose(BaseTool):
                  std: tuple = (58.395, 57.12, 57.375),
                  to_openpose: bool = False,
                  backend: str = 'onnxruntime',
-                 device: str = 'cpu'):
+                 device: str = 'cpu',
+                 batch_size: int = 8,
+                 use_cuda_graphs: bool = True):
+
+        # Batch processing config
+        self.batch_size = batch_size
+        self.use_cuda_graphs = use_cuda_graphs
 
         # TensorRT-specific attributes (init before super() for tensorrt backend)
         self._trt_engine = None
@@ -34,9 +47,15 @@ class RTMPose(BaseTool):
         self._trt_output_tensors = {}
         self._trt_input_name = None
         self._cuda_graph = None
+        self._graph_captured = False
         self._graph_input_buffer = None
         self._gpu_norm_mean = None
         self._gpu_norm_std = None
+
+        # Batch preprocessing buffers (allocated lazily)
+        self._batch_gpu_buffer = None
+        self._batch_centers = None
+        self._batch_scales = None
 
         # For tensorrt backend, skip BaseTool init (it doesn't know tensorrt)
         # and handle everything ourselves
@@ -205,7 +224,8 @@ class RTMPose(BaseTool):
         cache_dir = Path.home() / ".cache" / "rtmlib" / "trt_engines"
         cache_dir.mkdir(parents=True, exist_ok=True)
 
-        engine_name = f"{model_stem}_{size_str}_fp16.engine"
+        # Include batch size in engine name for batch-specific optimization
+        engine_name = f"{model_stem}_{size_str}_b{self.batch_size}_fp16.engine"
         engine_path = str(cache_dir / engine_name)
 
         # Check if engine already exists
@@ -218,11 +238,12 @@ class RTMPose(BaseTool):
         return self._build_tensorrt_engine(self.onnx_model_path, engine_path)
 
     def _build_tensorrt_engine(self, onnx_path: str, engine_path: str) -> Optional[str]:
-        """Build TensorRT engine from ONNX model with FP16 precision."""
+        """Build TensorRT engine from ONNX model with FP16 precision and batch support."""
         try:
             import tensorrt as trt
 
             print(f"[RTMPose] Building TensorRT engine from {onnx_path}")
+            print(f"[RTMPose] Target batch size: {self.batch_size}")
 
             # Create builder and network
             logger = trt.Logger(trt.Logger.WARNING)
@@ -247,19 +268,19 @@ class RTMPose(BaseTool):
                 config.set_flag(trt.BuilderFlag.FP16)
                 print("[RTMPose] FP16 enabled")
 
-            # Set optimization profile for static batch size
+            # Set optimization profile with configured batch size
             profile = builder.create_optimization_profile()
             input_tensor = network.get_input(0)
             input_name = input_tensor.name
 
             # Get shape from ONNX (should be something like [1, 3, 256, 192])
             onnx_shape = input_tensor.shape
-            batch_size = onnx_shape[0] if onnx_shape[0] > 0 else 1
             c = onnx_shape[1] if onnx_shape[1] > 0 else 3
             h = onnx_shape[2] if onnx_shape[2] > 0 else self.model_input_size[1]
             w = onnx_shape[3] if onnx_shape[3] > 0 else self.model_input_size[0]
 
-            input_shape = (batch_size, c, h, w)
+            # Use configured batch size (override ONNX batch=1)
+            input_shape = (self.batch_size, c, h, w)
             profile.set_shape(input_name, input_shape, input_shape, input_shape)
             config.add_optimization_profile(profile)
 
@@ -386,54 +407,204 @@ class RTMPose(BaseTool):
                 )
                 self._trt_stream.synchronize()
 
-            # Capture CUDA graph
-            self._cuda_graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(self._cuda_graph, stream=self._trt_stream):
-                self._trt_context.execute_async_v3(
-                    stream_handle=self._trt_stream.cuda_stream
-                )
-
-            print("[RTMPose] CUDA graph captured successfully")
+            # Capture CUDA graph (only if enabled)
+            if self.use_cuda_graphs:
+                self._cuda_graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(self._cuda_graph, stream=self._trt_stream):
+                    self._trt_context.execute_async_v3(
+                        stream_handle=self._trt_stream.cuda_stream
+                    )
+                self._graph_captured = True
+                print("[RTMPose] CUDA graph captured successfully")
+            else:
+                print("[RTMPose] CUDA graphs disabled by config")
 
         except Exception as e:
             print(f"[RTMPose] CUDA graph capture failed: {e}, using standard execution")
             self._cuda_graph = None
+            self._graph_captured = False
 
     def _inference_tensorrt_batch(self, image: np.ndarray, bboxes: list):
-        """Fast TensorRT inference with GPU preprocessing."""
+        """True batch TensorRT inference - processes all people in parallel.
+
+        Key optimizations:
+        - Single image upload to GPU
+        - Batched affine transforms via grid_sample
+        - Single TensorRT execution for all people
+        - Vectorized postprocessing
+        """
         import torch
         import torch.nn.functional as F
 
-        keypoints_list, scores_list = [], []
+        num_people = len(bboxes)
+        if num_people == 0:
+            return self._EMPTY_KEYPOINTS.copy(), self._EMPTY_SCORES.copy()
 
-        for bbox in bboxes:
-            # GPU preprocessing
-            img_tensor, center, scale = self._gpu_preprocess(image, bbox)
+        # Batch preprocess - all crops in one pass
+        batch_tensor, centers, scales = self._preprocess_batch(image, bboxes)
+
+        # Process in chunks if more people than engine batch size
+        all_simcc_x = []
+        all_simcc_y = []
+
+        for chunk_start in range(0, num_people, self.batch_size):
+            chunk_end = min(chunk_start + self.batch_size, num_people)
+            chunk_size = chunk_end - chunk_start
+            chunk_tensor = batch_tensor[chunk_start:chunk_end]
+
+            # Pad if needed to match engine batch size
+            if chunk_size < self.batch_size:
+                pad_size = self.batch_size - chunk_size
+                padding = torch.zeros(
+                    (pad_size,) + chunk_tensor.shape[1:],
+                    dtype=chunk_tensor.dtype,
+                    device=chunk_tensor.device
+                )
+                chunk_tensor = torch.cat([chunk_tensor, padding], dim=0)
 
             # Copy to TensorRT input buffer
-            self._trt_input_tensors[self._trt_input_name].copy_(img_tensor)
+            self._trt_input_tensors[self._trt_input_name].copy_(chunk_tensor)
 
-            # Execute inference (use CUDA graph if available)
-            if self._cuda_graph is not None:
+            # Execute batch inference
+            if self._cuda_graph is not None and self._graph_captured:
                 self._cuda_graph.replay()
             else:
                 self._trt_context.execute_async_v3(
                     stream_handle=self._trt_stream.cuda_stream
                 )
-            self._trt_stream.synchronize()
 
-            # Get outputs and convert to numpy
+            # Get outputs (extract only valid results, not padding)
             output_names = list(self._trt_output_tensors.keys())
-            simcc_x = self._trt_output_tensors[output_names[0]].cpu().numpy()
-            simcc_y = self._trt_output_tensors[output_names[1]].cpu().numpy()
+            simcc_x = self._trt_output_tensors[output_names[0]][:chunk_size].cpu().numpy()
+            simcc_y = self._trt_output_tensors[output_names[1]][:chunk_size].cpu().numpy()
 
-            # Postprocess
-            kpts, score = self.postprocess([simcc_x, simcc_y], center, scale)
-            keypoints_list.append(kpts)
-            scores_list.append(score)
+            all_simcc_x.append(simcc_x)
+            all_simcc_y.append(simcc_y)
 
-        keypoints = np.concatenate(keypoints_list, axis=0)
-        scores = np.concatenate(scores_list, axis=0)
+        # Concatenate all chunks
+        simcc_x = np.concatenate(all_simcc_x, axis=0)
+        simcc_y = np.concatenate(all_simcc_y, axis=0)
+
+        # Batch postprocess
+        keypoints, scores = self._postprocess_batch(simcc_x, simcc_y, centers, scales)
+
+        return keypoints, scores
+
+    def _preprocess_batch(self, image: np.ndarray, bboxes: list):
+        """Batch GPU preprocessing - all crops in one pass.
+
+        Optimizations:
+        - Single image upload to GPU
+        - Vectorized center/scale computation
+        - Batched affine_grid + grid_sample
+        - Single normalization pass
+        """
+        import torch
+        import torch.nn.functional as F
+
+        num_people = len(bboxes)
+        w, h = self.model_input_size
+        aspect_ratio = w / h
+        src_h, src_w = image.shape[:2]
+
+        # Compute centers and scales for all bboxes (CPU - vectorized)
+        bboxes_arr = np.array(bboxes, dtype=np.float32)
+        centers, scales = self._compute_centers_scales_batch(bboxes_arr, aspect_ratio)
+
+        # Compute all theta matrices (CPU)
+        thetas = np.zeros((num_people, 2, 3), dtype=np.float32)
+        for i in range(num_people):
+            warp_mat = get_warp_matrix(centers[i], scales[i], 0, output_size=(w, h))
+            thetas[i] = self._warp_mat_to_theta(warp_mat, src_w, src_h, w, h)
+
+        # Upload image to GPU once
+        img_tensor = torch.from_numpy(image).cuda(non_blocking=True)
+        img_tensor = img_tensor.permute(2, 0, 1).float()  # (3, H, W)
+
+        # Expand to batch dimension for grid_sample
+        # Each person gets the same source image
+        img_batch = img_tensor.unsqueeze(0).expand(num_people, -1, -1, -1)
+
+        # Batch affine transforms on GPU
+        theta_tensor = torch.from_numpy(thetas).cuda()
+        grid = F.affine_grid(theta_tensor, (num_people, 3, h, w), align_corners=False)
+        warped = F.grid_sample(img_batch, grid, mode='bilinear', align_corners=False)
+
+        # Batch normalization
+        warped = warped.sub_(self._gpu_norm_mean).div_(self._gpu_norm_std)
+
+        return warped, centers, scales
+
+    def _compute_centers_scales_batch(self, bboxes: np.ndarray, aspect_ratio: float):
+        """Vectorized center/scale computation for all bboxes.
+
+        Args:
+            bboxes: (N, 4) array of xyxy bboxes
+            aspect_ratio: w/h of model input
+
+        Returns:
+            centers: (N, 2) array
+            scales: (N, 2) array
+        """
+        # bbox_xyxy2cs logic vectorized
+        x1, y1, x2, y2 = bboxes[:, 0], bboxes[:, 1], bboxes[:, 2], bboxes[:, 3]
+
+        centers = np.stack([(x1 + x2) * 0.5, (y1 + y2) * 0.5], axis=1)
+
+        # Scale with padding=1.25
+        bbox_w = (x2 - x1) * 1.25
+        bbox_h = (y2 - y1) * 1.25
+
+        # Adjust for aspect ratio
+        scales = np.zeros((len(bboxes), 2), dtype=np.float32)
+        wider = bbox_w > bbox_h * aspect_ratio
+        scales[wider, 0] = bbox_w[wider]
+        scales[wider, 1] = bbox_w[wider] / aspect_ratio
+        scales[~wider, 0] = bbox_h[~wider] * aspect_ratio
+        scales[~wider, 1] = bbox_h[~wider]
+
+        return centers, scales
+
+    def _postprocess_batch(
+        self,
+        simcc_x: np.ndarray,
+        simcc_y: np.ndarray,
+        centers: np.ndarray,
+        scales: np.ndarray,
+        simcc_split_ratio: float = 2.0
+    ):
+        """Vectorized batch postprocessing.
+
+        Args:
+            simcc_x: (N, num_keypoints, W*2) SimCC x predictions
+            simcc_y: (N, num_keypoints, H*2) SimCC y predictions
+            centers: (N, 2) bbox centers
+            scales: (N, 2) bbox scales
+
+        Returns:
+            keypoints: (N, num_keypoints, 2)
+            scores: (N, num_keypoints)
+        """
+        # Decode simcc - get max positions and scores
+        # simcc_x shape: (N, 17, W*2), simcc_y shape: (N, 17, H*2)
+        x_locs = np.argmax(simcc_x, axis=2)  # (N, 17)
+        y_locs = np.argmax(simcc_y, axis=2)  # (N, 17)
+
+        # Get scores from max values
+        N, num_kpts = x_locs.shape
+        x_scores = np.take_along_axis(simcc_x, x_locs[:, :, None], axis=2).squeeze(2)
+        y_scores = np.take_along_axis(simcc_y, y_locs[:, :, None], axis=2).squeeze(2)
+        scores = np.minimum(x_scores, y_scores)  # (N, 17)
+
+        # Stack to (N, 17, 2) and apply split ratio
+        locs = np.stack([x_locs, y_locs], axis=2).astype(np.float32)
+        keypoints = locs / simcc_split_ratio
+
+        # Rescale keypoints: keypoints / model_size * scale + center - scale/2
+        model_size = np.array(self.model_input_size, dtype=np.float32)  # (w, h)
+        keypoints = keypoints / model_size * scales[:, None, :]
+        keypoints = keypoints + centers[:, None, :] - scales[:, None, :] / 2
+
         return keypoints, scores
 
     def _gpu_preprocess(self, image: np.ndarray, bbox: list):

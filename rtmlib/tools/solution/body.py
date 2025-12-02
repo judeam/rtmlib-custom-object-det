@@ -97,8 +97,24 @@ class Body:
                  backend: str = 'onnxruntime',
                  device: str = 'cpu',
                  batch_size: int = 1,
+                 pose_batch_size: int = 8,
                  use_cuda_graphs: bool = True):
+        """Initialize Body pose estimation pipeline.
 
+        Args:
+            det: Detection model path (None for default)
+            det_input_size: Detection model input size
+            det_score_thr: Detection confidence threshold
+            pose: Pose model path (None for default)
+            pose_input_size: Pose model input size
+            mode: 'performance', 'balanced', or 'lightweight'
+            to_openpose: Convert keypoints to OpenPose format
+            backend: 'onnxruntime' or 'tensorrt'
+            device: 'cpu' or 'cuda'
+            batch_size: Batch size for detection model
+            pose_batch_size: Batch size for pose model (max people per inference)
+            use_cuda_graphs: Enable CUDA graphs for kernel replay optimization
+        """
         if pose is not None and 'rtmo' in pose:
             from .. import RTMO
 
@@ -136,7 +152,9 @@ class Body:
                                       model_input_size=pose_input_size,
                                       to_openpose=to_openpose,
                                       backend=backend,
-                                      device=device)
+                                      device=device,
+                                      batch_size=pose_batch_size,
+                                      use_cuda_graphs=use_cuda_graphs)
 
     def __call__(self, image: np.ndarray):
         if self.one_stage:
