@@ -5,6 +5,7 @@ from pathlib import Path
 import numpy as np
 
 from ..base import BaseTool
+from ..file import download_checkpoint
 from .post_processings import convert_coco_to_openpose, get_simcc_maximum
 from .pre_processings import bbox_xyxy2cs, top_down_affine, get_warp_matrix
 
@@ -24,20 +25,8 @@ class RTMPose(BaseTool):
                  to_openpose: bool = False,
                  backend: str = 'onnxruntime',
                  device: str = 'cpu'):
-        super().__init__(onnx_model, model_input_size, mean, std, backend,
-                         device)
-        self.to_openpose = to_openpose
-        self.onnx_model_path = onnx_model
 
-        # Pre-compute normalization arrays for CPU preprocessing (fallback)
-        if mean is not None:
-            self._mean_arr = np.array(mean, dtype=np.float32)
-            self._std_arr = np.array(std, dtype=np.float32)
-        else:
-            self._mean_arr = None
-            self._std_arr = None
-
-        # TensorRT-specific attributes
+        # TensorRT-specific attributes (init before super() for tensorrt backend)
         self._trt_engine = None
         self._trt_context = None
         self._trt_stream = None
@@ -46,16 +35,50 @@ class RTMPose(BaseTool):
         self._trt_input_name = None
         self._cuda_graph = None
         self._graph_input_buffer = None
-
-        # GPU normalization constants (for GPU preprocessing)
         self._gpu_norm_mean = None
         self._gpu_norm_std = None
 
-        # Initialize native TensorRT when explicitly requested
-        # backend='tensorrt' → native TensorRT with GPU preprocessing + CUDA graphs
-        # backend='onnxruntime', device='cuda' → ONNX RT with TensorRT EP (original)
+        # For tensorrt backend, skip BaseTool init (it doesn't know tensorrt)
+        # and handle everything ourselves
         if backend == 'tensorrt' and device == 'cuda':
+            # Download model if it's a URL (like BaseTool does)
+            if onnx_model.startswith('http'):
+                onnx_model = download_checkpoint(onnx_model)
+
+            # Set attributes that BaseTool would set
+            self.model_input_size = model_input_size
+            self.mean = mean
+            self.std = std
+            self.backend = backend
+            self.device = device
+            self.session = None  # Not used for tensorrt
+            self.onnx_model_path = onnx_model
+            self.to_openpose = to_openpose
+
+            # Pre-compute normalization arrays for CPU fallback
+            if mean is not None:
+                self._mean_arr = np.array(mean, dtype=np.float32)
+                self._std_arr = np.array(std, dtype=np.float32)
+            else:
+                self._mean_arr = None
+                self._std_arr = None
+
+            # Initialize native TensorRT
             self._try_init_tensorrt()
+        else:
+            # Use standard BaseTool initialization for other backends
+            super().__init__(onnx_model, model_input_size, mean, std, backend,
+                             device)
+            self.to_openpose = to_openpose
+            self.onnx_model_path = onnx_model
+
+            # Pre-compute normalization arrays for CPU preprocessing
+            if mean is not None:
+                self._mean_arr = np.array(mean, dtype=np.float32)
+                self._std_arr = np.array(std, dtype=np.float32)
+            else:
+                self._mean_arr = None
+                self._std_arr = None
 
     def __call__(self, image: np.ndarray, bboxes: list = []):
         if len(bboxes) == 0:
