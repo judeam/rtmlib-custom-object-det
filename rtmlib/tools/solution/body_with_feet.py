@@ -78,7 +78,10 @@ class BodyWithFeet:
                  mode: str = 'balanced',
                  to_openpose: bool = False,
                  backend: str = 'onnxruntime',
-                 device: str = 'cpu'):
+                 device: str = 'cpu',
+                 batch_size: int = 1,
+                 pose_batch_size: int = 8,
+                 use_cuda_graphs: bool = True):
         """
         Initialize the Halpe26 pose estimation model.
 
@@ -92,6 +95,9 @@ class BodyWithFeet:
             to_openpose (bool, optional): Whether to convert output to OpenPose format. Default is False.
             backend (str, optional): Backend for inference ('onnxruntime' or 'opencv'). Default is 'onnxruntime'.
             device (str, optional): Device for inference ('cpu' or 'cuda'). Default is 'cpu'.
+            batch_size (int, optional): Batch size for detection model. Default is 1.
+            pose_batch_size (int, optional): Batch size for pose model (max people per inference). Default is 8.
+            use_cuda_graphs (bool, optional): Enable CUDA graphs for kernel replay optimization. Default is True.
         """
         from .. import RFDETRNano, RTMPose
 
@@ -108,12 +114,16 @@ class BodyWithFeet:
                                     score_thr=det_score_thr,
                                     backend=backend,
                                     device=device,
-                                    export_format='engine')
+                                    export_format='engine',
+                                    batch_size=batch_size,
+                                    use_cuda_graphs=use_cuda_graphs)
         self.pose_model = RTMPose(pose,
                                   model_input_size=pose_input_size,
                                   to_openpose=to_openpose,
                                   backend=backend,
-                                  device=device)
+                                  device=device,
+                                  batch_size=pose_batch_size,
+                                  use_cuda_graphs=use_cuda_graphs)
 
     def __call__(self, image: np.ndarray):
         """

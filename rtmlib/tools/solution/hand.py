@@ -65,7 +65,23 @@ class Hand:
                  mode: str = 'lightweight',
                  to_openpose: bool = False,
                  backend: str = 'onnxruntime',
-                 device: str = 'cpu'):
+                 device: str = 'cpu',
+                 pose_batch_size: int = 8,
+                 use_cuda_graphs: bool = True):
+        """Initialize Hand pose estimation pipeline.
+
+        Args:
+            det: Detection model path (None for default)
+            det_input_size: Detection model input size
+            pose: Pose model path (None for default)
+            pose_input_size: Pose model input size
+            mode: Only 'lightweight' currently supported
+            to_openpose: Convert keypoints to OpenPose format
+            backend: 'onnxruntime' or 'tensorrt'
+            device: 'cpu' or 'cuda'
+            pose_batch_size: Batch size for pose model (max hands per inference)
+            use_cuda_graphs: Enable CUDA graphs for kernel replay optimization
+        """
         print('hand', backend, device)
         assert mode == 'lightweight', (
             'Currently only support lightweight mode.')
@@ -86,7 +102,9 @@ class Hand:
                                   model_input_size=pose_input_size,
                                   to_openpose=to_openpose,
                                   backend=backend,
-                                  device=device)
+                                  device=device,
+                                  batch_size=pose_batch_size,
+                                  use_cuda_graphs=use_cuda_graphs)
 
     def __call__(self, image: np.ndarray):
         bboxes = self.det_model(image)

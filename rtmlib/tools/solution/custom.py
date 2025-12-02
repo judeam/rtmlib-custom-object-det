@@ -82,15 +82,43 @@ class Custom:
                  mode: str = None,
                  to_openpose: bool = False,
                  backend: str = 'onnxruntime',
-                 device: str = 'cpu'):
+                 device: str = 'cpu',
+                 batch_size: int = 1,
+                 pose_batch_size: int = 8,
+                 use_cuda_graphs: bool = True):
+        """Initialize Custom pose estimation pipeline.
 
+        Args:
+            det_class: Detection model class name (e.g., 'RFDETRNano', 'RTMDet')
+            det: Detection model path
+            det_input_size: Detection model input size
+            pose_class: Pose model class name (e.g., 'RTMPose', 'RTMO')
+            pose: Pose model path
+            pose_input_size: Pose model input size
+            mode: Mode (unused, for compatibility)
+            to_openpose: Convert keypoints to OpenPose format
+            backend: 'onnxruntime' or 'tensorrt'
+            device: 'cpu' or 'cuda'
+            batch_size: Batch size for detection model
+            pose_batch_size: Batch size for pose model (max people per inference)
+            use_cuda_graphs: Enable CUDA graphs for kernel replay optimization
+        """
         if det_class is not None:
             try:
-                det_class = getattr(rtmlib_module, det_class)
-                self.det_model = det_class(det,
-                                    model_input_size=det_input_size,
-                                    backend=backend,
-                                    device=device)
+                det_cls = getattr(rtmlib_module, det_class)
+                # Pass batch params if the detector supports them (RFDETRNano)
+                if det_class == 'RFDETRNano':
+                    self.det_model = det_cls(det,
+                                        model_input_size=det_input_size,
+                                        backend=backend,
+                                        device=device,
+                                        batch_size=batch_size,
+                                        use_cuda_graphs=use_cuda_graphs)
+                else:
+                    self.det_model = det_cls(det,
+                                        model_input_size=det_input_size,
+                                        backend=backend,
+                                        device=device)
                 self.one_stage = False
 
             except ImportError:
@@ -100,12 +128,22 @@ class Custom:
 
         if pose_class is not None:
             try:
-                pose_class = getattr(rtmlib_module, pose_class)
-                self.pose_model = pose_class(pose,
-                                    model_input_size=pose_input_size,
-                                    to_openpose=to_openpose,
-                                    backend=backend,
-                                    device=device)
+                pose_cls = getattr(rtmlib_module, pose_class)
+                # Pass batch params if the pose model supports them (RTMPose)
+                if pose_class == 'RTMPose':
+                    self.pose_model = pose_cls(pose,
+                                        model_input_size=pose_input_size,
+                                        to_openpose=to_openpose,
+                                        backend=backend,
+                                        device=device,
+                                        batch_size=pose_batch_size,
+                                        use_cuda_graphs=use_cuda_graphs)
+                else:
+                    self.pose_model = pose_cls(pose,
+                                        model_input_size=pose_input_size,
+                                        to_openpose=to_openpose,
+                                        backend=backend,
+                                        device=device)
             except ImportError:
                 raise ImportError(f'{pose_class} is not supported by rtmlib.')
 

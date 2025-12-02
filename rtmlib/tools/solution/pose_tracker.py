@@ -113,6 +113,7 @@ class PoseTracker:
     - Position smoothing to reduce trajectory jitter
     - Teleportation detection to reject unrealistic jumps
     - Track re-identification to recover lost tracks
+    - Batch processing for multi-person pose estimation
 
     Args:
         solution (type): rtmlib solutions, e.g. Wholebody, Body, Custom, etc.
@@ -123,6 +124,9 @@ class PoseTracker:
         to_openpose (bool): Whether to use openpose-style skeleton.
         backend (str): Backend of pose estimation model.
         device (str): Device of pose estimation model.
+        batch_size (int): Batch size for detection model.
+        pose_batch_size (int): Batch size for pose model (max people per inference).
+        use_cuda_graphs (bool): Enable CUDA graphs for kernel replay optimization.
         use_hungarian (bool): Use Hungarian algorithm for optimal matching.
         velocity_prediction (bool): Enable velocity-based prediction.
         velocity_alpha (float): EMA weight for velocity smoothing (0.0-1.0).
@@ -147,6 +151,10 @@ class PoseTracker:
         to_openpose: bool = False,
         backend: str = 'onnxruntime',
         device: str = 'cpu',
+        # Batch processing options
+        batch_size: int = 1,
+        pose_batch_size: int = 8,
+        use_cuda_graphs: bool = True,
         # Enhanced tracking options (all backward compatible with defaults)
         use_hungarian: bool = True,
         velocity_prediction: bool = True,
@@ -160,10 +168,21 @@ class PoseTracker:
         reid_max_tracks: int = 10,
         max_age: int = 30
     ):
-        model = solution(mode=mode,
-                         to_openpose=to_openpose,
-                         backend=backend,
-                         device=device)
+        # Try to pass batch params if solution supports them
+        try:
+            model = solution(mode=mode,
+                             to_openpose=to_openpose,
+                             backend=backend,
+                             device=device,
+                             batch_size=batch_size,
+                             pose_batch_size=pose_batch_size,
+                             use_cuda_graphs=use_cuda_graphs)
+        except TypeError:
+            # Fallback for solutions that don't support batch params
+            model = solution(mode=mode,
+                             to_openpose=to_openpose,
+                             backend=backend,
+                             device=device)
 
         try:
             self.det_model = model.det_model
