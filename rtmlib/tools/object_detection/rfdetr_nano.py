@@ -255,13 +255,12 @@ class RFDETRNano(BaseTool):
             output_dir = Path(onnx_path).parent
 
             # Use RF-DETR fork's new API with batch_size parameter
-            # The fork supports: model.export(output_dir=..., batch_size=N, shape=(W, H))
-            resolution = self.model_input_size[0]
+            # Note: Don't pass shape parameter - the model uses its configured resolution
+            # and RF-DETR validates shape % 14 == 0 (DINOv2 patch size requirement)
             self.model.export(
                 output_dir=str(output_dir),
                 opset_version=17,  # Enables INormalizationLayer for FP16/BF16
                 batch_size=self.batch_size,
-                shape=(resolution, resolution),
             )
 
             # RF-DETR exports to 'output/inference_model.onnx' or similar
