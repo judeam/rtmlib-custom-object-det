@@ -296,13 +296,14 @@ class RFDETRNano(BaseTool):
             # Create CUDA stream
             self._stream = torch.cuda.Stream()
 
-            # CUDA Graph state for zero-overhead inference replay
-            self._cuda_graph = None
-            self._cuda_graph_warmup_done = False
-
             # Pre-compute normalization constants (avoid allocation each inference)
             self._norm_mean = torch.tensor([0.485, 0.456, 0.406], device="cuda").view(1, 3, 1, 1)
             self._norm_std = torch.tensor([0.229, 0.224, 0.225], device="cuda").view(1, 3, 1, 1)
+
+            # CUDA Graph state
+            self._cuda_graph = None
+            self._graph_warmup_count = 0
+            self._graph_warmup_needed = 3  # Number of warmup runs before capture
 
             print("TensorRT engine loaded successfully")
 
@@ -432,21 +433,30 @@ class RFDETRNano(BaseTool):
         self._input_tensors[self._input_name].copy_(img_tensor)
 
         # Execute inference with CUDA Graph optimization
-        if not self._cuda_graph_warmup_done:
-            # First run: warmup without graph capture
+        if self._cuda_graph is not None:
+            # Fast path: replay captured graph
+            self._cuda_graph.replay()
+            self._stream.synchronize()
+        elif self._graph_warmup_count < self._graph_warmup_needed:
+            # Warmup phase: run normally to let TensorRT stabilize
             with torch.cuda.stream(self._stream):
                 self._context.execute_async_v3(stream_handle=self._stream.cuda_stream)
             self._stream.synchronize()
+            self._graph_warmup_count += 1
+        else:
+            # Capture phase: create CUDA graph after warmup
+            # Full sync before capture to ensure clean state
+            torch.cuda.synchronize()
 
-            # Capture CUDA graph for subsequent runs
+            # Capture the TensorRT execution into a graph
             self._cuda_graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(self._cuda_graph, stream=self._stream):
                 self._context.execute_async_v3(stream_handle=self._stream.cuda_stream)
-            self._cuda_graph_warmup_done = True
-        else:
-            # Replay captured graph (zero CPU overhead)
+
+            # Run the captured graph
             self._cuda_graph.replay()
             self._stream.synchronize()
+            print("CUDA Graph captured for TensorRT inference")
 
         # Parse outputs using name-based lookup
         boxes = self._output_tensors[self._boxes_name]
