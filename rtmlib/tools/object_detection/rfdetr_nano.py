@@ -21,6 +21,7 @@ class RFDETRNano(BaseTool):
     """
 
     PERSON_CLASS = 5  # Person class in the fine-tuned model (class 5 based on debug output)
+    _EMPTY_BOXES = np.array([], dtype=np.float32).reshape(0, 4)  # Pre-allocated empty result
 
     def __init__(
         self,
@@ -538,19 +539,22 @@ class RFDETRNano(BaseTool):
         """Run inference using TensorRT engine."""
         import torch
         import torch.nn.functional as F
-        import cv2
 
         # Get original image size for coordinate scaling
         orig_h, orig_w = image.shape[:2]
         resolution = self.model_input_size[0]
 
-        # Preprocess image
-        # Convert BGR to RGB
-        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        # Preprocess image - upload BGR directly, convert on GPU
+        # Check contiguous to avoid unnecessary copy
+        if not image.flags['C_CONTIGUOUS']:
+            image = np.ascontiguousarray(image)
 
-        # Convert to tensor and move to GPU
-        img_tensor = torch.from_numpy(image_rgb).cuda(non_blocking=True)
+        # Convert to tensor and move to GPU (still BGR)
+        img_tensor = torch.from_numpy(image).cuda(non_blocking=True)
         img_tensor = img_tensor.permute(2, 0, 1).unsqueeze(0).float()  # (1, 3, H, W)
+
+        # BGR→RGB channel swap on GPU (faster than CPU cv2.cvtColor)
+        img_tensor = img_tensor[:, [2, 1, 0], :, :]
 
         # Resize to model input size
         if img_tensor.shape[2] != resolution or img_tensor.shape[3] != resolution:
@@ -695,13 +699,14 @@ class RFDETRNano(BaseTool):
         Optimized process (3.5x faster than numpy.stack approach):
         1. Use pre-allocated GPU buffer for fast CPU->GPU transfer
         2. Transfer frames directly without numpy.stack
-        3. Resize + normalize on GPU
+        3. BGR→RGB conversion on GPU (faster than CPU cv2.cvtColor)
+        4. Resize + normalize on GPU
 
         Args:
-            frames: List of RGB frames as numpy arrays
+            frames: List of BGR frames as numpy arrays (from OpenCV)
 
         Returns:
-            Preprocessed batch as GPU tensor (batch, 3, H, W)
+            Preprocessed batch as GPU tensor (batch, 3, H, W) in RGB format
         """
         import torch
         import torch.nn.functional as F
@@ -724,13 +729,19 @@ class RFDETRNano(BaseTool):
 
         # Fast path: copy frames directly to GPU (avoids numpy.stack bottleneck)
         for i, frame in enumerate(frames):
+            # Check contiguous to avoid unnecessary copy
+            if not frame.flags['C_CONTIGUOUS']:
+                frame = np.ascontiguousarray(frame)
             gpu_buffer[i].copy_(
-                torch.from_numpy(np.ascontiguousarray(frame)),
+                torch.from_numpy(frame),
                 non_blocking=True
             )
 
         # Convert to float and reorder dimensions on GPU: (B, H, W, C) -> (B, C, H, W)
         batch_tensor = gpu_buffer[:batch_size].permute(0, 3, 1, 2).float()
+
+        # BGR→RGB channel swap on GPU (faster than CPU cv2.cvtColor)
+        batch_tensor = batch_tensor[:, [2, 1, 0], :, :]
 
         # Resize on GPU if needed
         if frame_h != resolution or frame_w != resolution:
@@ -797,7 +808,6 @@ class RFDETRNano(BaseTool):
             List of detection arrays per frame
         """
         import torch
-        import cv2
 
         if threshold is None:
             threshold = self.score_thr
@@ -805,10 +815,8 @@ class RFDETRNano(BaseTool):
         # Get original sizes for coordinate scaling
         frame_sizes = [(f.shape[1], f.shape[0]) for f in frames]
 
-        # Convert BGR to RGB
-        rgb_frames = [cv2.cvtColor(f, cv2.COLOR_BGR2RGB) for f in frames]
-
-        actual_batch = len(rgb_frames)
+        # Frames stay as BGR - channel swap happens on GPU in _preprocess_batch_for_tensorrt
+        actual_batch = len(frames)
         engine_batch = self.batch_size
 
         all_results = []
@@ -816,7 +824,7 @@ class RFDETRNano(BaseTool):
         # Process in chunks matching engine batch size
         for chunk_start in range(0, actual_batch, engine_batch):
             chunk_end = min(chunk_start + engine_batch, actual_batch)
-            chunk_frames = rgb_frames[chunk_start:chunk_end]
+            chunk_frames = frames[chunk_start:chunk_end]
             chunk_sizes = frame_sizes[chunk_start:chunk_end]
 
             # Preprocess on GPU
@@ -927,7 +935,7 @@ class RFDETRNano(BaseTool):
         for batch_idx in range(num_frames):
             valid_indices = np.nonzero(valid_cpu[batch_idx])[0]
             if len(valid_indices) == 0:
-                results.append(np.array([]).reshape(0, 4))
+                results.append(self._EMPTY_BOXES)
             else:
                 results.append(boxes_cpu[batch_idx, valid_indices])
 
