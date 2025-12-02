@@ -300,11 +300,6 @@ class RFDETRNano(BaseTool):
             self._norm_mean = torch.tensor([0.485, 0.456, 0.406], device="cuda").view(1, 3, 1, 1)
             self._norm_std = torch.tensor([0.229, 0.224, 0.225], device="cuda").view(1, 3, 1, 1)
 
-            # CUDA Graph state
-            self._cuda_graph = None
-            self._graph_warmup_count = 0
-            self._graph_warmup_needed = 3  # Number of warmup runs before capture
-
             print("TensorRT engine loaded successfully")
 
         except Exception as e:
@@ -432,31 +427,10 @@ class RFDETRNano(BaseTool):
         # Copy input data
         self._input_tensors[self._input_name].copy_(img_tensor)
 
-        # Execute inference with CUDA Graph optimization
-        if self._cuda_graph is not None:
-            # Fast path: replay captured graph
-            self._cuda_graph.replay()
-            self._stream.synchronize()
-        elif self._graph_warmup_count < self._graph_warmup_needed:
-            # Warmup phase: run normally to let TensorRT stabilize
-            with torch.cuda.stream(self._stream):
-                self._context.execute_async_v3(stream_handle=self._stream.cuda_stream)
-            self._stream.synchronize()
-            self._graph_warmup_count += 1
-        else:
-            # Capture phase: create CUDA graph after warmup
-            # Full sync before capture to ensure clean state
-            torch.cuda.synchronize()
-
-            # Capture the TensorRT execution into a graph
-            self._cuda_graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(self._cuda_graph, stream=self._stream):
-                self._context.execute_async_v3(stream_handle=self._stream.cuda_stream)
-
-            # Run the captured graph
-            self._cuda_graph.replay()
-            self._stream.synchronize()
-            print("CUDA Graph captured for TensorRT inference")
+        # Execute inference
+        with torch.cuda.stream(self._stream):
+            self._context.execute_async_v3(stream_handle=self._stream.cuda_stream)
+        self._stream.synchronize()  # Stream-only sync (not full device sync)
 
         # Parse outputs using name-based lookup
         boxes = self._output_tensors[self._boxes_name]

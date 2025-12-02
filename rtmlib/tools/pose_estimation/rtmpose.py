@@ -28,57 +28,21 @@ class RTMPose(BaseTool):
             self._mean_arr = None
             self._std_arr = None
 
-    # Fixed batch size to avoid TensorRT engine rebuilds
-    MAX_BATCH_SIZE = 4
-
     def __call__(self, image: np.ndarray, bboxes: list = []):
         if len(bboxes) == 0:
             bboxes = [[0, 0, image.shape[1], image.shape[0]]]
 
-        n_boxes = len(bboxes)
-        if n_boxes == 0:
-            return np.array([]).reshape(0, 17, 2), np.array([]).reshape(0, 17)
+        keypoints, scores = [], []
+        for bbox in bboxes:
+            img, center, scale = self.preprocess(image, bbox)
+            outputs = self.inference(img)
+            kpts, score = self.postprocess(outputs, center, scale)
 
-        # Process in fixed-size batches to avoid TensorRT rebuilds
-        all_keypoints = []
-        all_scores = []
+            keypoints.append(kpts)
+            scores.append(score)
 
-        for batch_start in range(0, n_boxes, self.MAX_BATCH_SIZE):
-            batch_end = min(batch_start + self.MAX_BATCH_SIZE, n_boxes)
-            batch_bboxes = bboxes[batch_start:batch_end]
-            actual_batch_size = len(batch_bboxes)
-
-            # Batch preprocess
-            h, w = self.model_input_size[1], self.model_input_size[0]
-            # Always allocate MAX_BATCH_SIZE for consistent TensorRT engine
-            batch = np.zeros((self.MAX_BATCH_SIZE, 3, h, w), dtype=np.float32)
-            centers = np.zeros((self.MAX_BATCH_SIZE, 2), dtype=np.float32)
-            scales = np.zeros((self.MAX_BATCH_SIZE, 2), dtype=np.float32)
-
-            for i, bbox in enumerate(batch_bboxes):
-                img, center, scale = self.preprocess(image, bbox)
-                batch[i] = img.transpose(2, 0, 1)
-                centers[i] = center
-                scales[i] = scale
-
-            # Pad remaining slots with copies of first (will be discarded)
-            if actual_batch_size < self.MAX_BATCH_SIZE:
-                for i in range(actual_batch_size, self.MAX_BATCH_SIZE):
-                    batch[i] = batch[0]
-                    centers[i] = centers[0]
-                    scales[i] = scales[0]
-
-            # Single batched inference with fixed batch size
-            outputs = self._batch_inference(batch)
-
-            # Batch postprocess (only take actual results)
-            keypoints, scores = self._batch_postprocess(outputs, centers, scales)
-            all_keypoints.append(keypoints[:actual_batch_size])
-            all_scores.append(scores[:actual_batch_size])
-
-        # Combine all batches
-        keypoints = np.concatenate(all_keypoints, axis=0)
-        scores = np.concatenate(all_scores, axis=0)
+        keypoints = np.concatenate(keypoints, axis=0)
+        scores = np.concatenate(scores, axis=0)
 
         if self.to_openpose:
             keypoints, scores = convert_coco_to_openpose(keypoints, scores)
