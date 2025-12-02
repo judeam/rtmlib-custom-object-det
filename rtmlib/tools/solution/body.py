@@ -95,7 +95,9 @@ class Body:
                  mode: str = 'balanced',
                  to_openpose: bool = False,
                  backend: str = 'onnxruntime',
-                 device: str = 'cpu'):
+                 device: str = 'cpu',
+                 batch_size: int = 1,
+                 use_cuda_graphs: bool = True):
 
         if pose is not None and 'rtmo' in pose:
             from .. import RTMO
@@ -127,7 +129,9 @@ class Body:
                                         score_thr=det_score_thr,
                                         backend=backend,
                                         device=device,
-                                        export_format='engine')
+                                        export_format='engine',
+                                        batch_size=batch_size,
+                                        use_cuda_graphs=use_cuda_graphs)
             self.pose_model = RTMPose(pose,
                                       model_input_size=pose_input_size,
                                       to_openpose=to_openpose,
@@ -142,3 +146,30 @@ class Body:
             keypoints, scores = self.pose_model(image, bboxes=bboxes)
 
         return keypoints, scores
+
+    def predict_batch(self, images: list):
+        """Run batch pose estimation on multiple images.
+
+        Uses batch detection for improved throughput when processing
+        multiple frames (e.g., video processing).
+
+        Args:
+            images: List of input images (BGR format from OpenCV)
+
+        Returns:
+            List of (keypoints, scores) tuples, one per image
+        """
+        if self.one_stage:
+            # RTMO doesn't support batch processing, fall back to sequential
+            return [self.pose_model(img) for img in images]
+
+        # Batch detection for all frames
+        all_bboxes = self.det_model.predict_batch(images)
+
+        # Run pose estimation per frame (pose model processes per-person)
+        results = []
+        for img, bboxes in zip(images, all_bboxes):
+            keypoints, scores = self.pose_model(img, bboxes=bboxes)
+            results.append((keypoints, scores))
+
+        return results

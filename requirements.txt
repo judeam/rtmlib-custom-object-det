@@ -5,4 +5,4 @@ opencv-python
 tqdm
 supervision
 torch
-rfdetr
+rfdetr @ git+https://github.com/jude-mingay-bps/rf-detr-tensorrt-batch.git
