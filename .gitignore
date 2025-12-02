@@ -116,6 +116,10 @@ venv.bak/
 *.pt
 *.engine
 models/*.pt
+models/*.onnx
 models/*.engine
+
+# Keep compressed model parts (under 100MB for GitHub)
+!models/*.pt.xz.part_*
 
 *.DS_Store

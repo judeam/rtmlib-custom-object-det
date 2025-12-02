@@ -83,7 +83,7 @@ class RFDETRNano(BaseTool):
             self._load_pytorch_model()
 
     def _resolve_model_path(self) -> str:
-        """Resolve the default model path."""
+        """Resolve the default model path, decompressing if needed."""
         current_dir = os.path.dirname(os.path.abspath(__file__))
 
         # Try in tools/models directory
@@ -105,13 +105,80 @@ class RFDETRNano(BaseTool):
         elif os.path.exists(dev_model_path):
             return dev_model_path
         else:
-            # Fallback: create models directory
-            models_dir = os.path.join(os.path.dirname(current_dir), 'models')
-            os.makedirs(models_dir, exist_ok=True)
-            expected_path = os.path.join(models_dir, 'rfdetr_nano_person.pt')
+            # Try to decompress from split xz parts
+            tools_models_dir = os.path.join(current_dir, '..', 'models')
+            tools_models_dir = os.path.abspath(tools_models_dir)
+            dev_models_dir = os.path.join(project_root, 'models')
+
+            # Check both possible locations for compressed parts
+            for models_dir, model_path in [
+                (tools_models_dir, tools_models_path),
+                (dev_models_dir, dev_model_path)
+            ]:
+                if self._decompress_model_if_needed(models_dir, model_path):
+                    return model_path
+
+            # Fallback: create models directory and raise error
+            os.makedirs(tools_models_dir, exist_ok=True)
             raise FileNotFoundError(
-                f"Model file not found. Please place 'rfdetr_nano_person.pt' in: {models_dir}"
+                f"Model file not found. Please place 'rfdetr_nano_person.pt' "
+                f"or compressed parts 'rfdetr_nano_person.pt.xz.part_*' in: {tools_models_dir}"
             )
+
+    def _decompress_model_if_needed(self, models_dir: str, output_path: str) -> bool:
+        """Decompress model from split xz parts if available.
+
+        The model is distributed as split xz-compressed parts to fit within
+        GitHub's 100MB file size limit. This method joins and decompresses
+        the parts on first run.
+
+        Args:
+            models_dir: Directory containing the compressed parts
+            output_path: Path where the decompressed .pt file should be written
+
+        Returns:
+            True if decompression succeeded or file already exists, False otherwise
+        """
+        import lzma
+        import glob
+
+        if os.path.exists(output_path):
+            return True
+
+        # Look for split xz parts
+        part_pattern = os.path.join(models_dir, 'rfdetr_nano_person.pt.xz.part_*')
+        parts = sorted(glob.glob(part_pattern))
+
+        if not parts:
+            return False
+
+        print(f"[RFDETRNano] Found {len(parts)} compressed model parts, decompressing...")
+        print(f"[RFDETRNano] This is a one-time operation on first run.")
+
+        try:
+            # Join parts and decompress
+            compressed_data = b''
+            for part_path in parts:
+                print(f"[RFDETRNano] Reading: {os.path.basename(part_path)}")
+                with open(part_path, 'rb') as f:
+                    compressed_data += f.read()
+
+            print(f"[RFDETRNano] Decompressing {len(compressed_data) / (1024*1024):.1f} MB...")
+            decompressed_data = lzma.decompress(compressed_data)
+
+            print(f"[RFDETRNano] Writing {len(decompressed_data) / (1024*1024):.1f} MB to {output_path}")
+            with open(output_path, 'wb') as f:
+                f.write(decompressed_data)
+
+            print(f"[RFDETRNano] Model decompression complete!")
+            return True
+
+        except Exception as e:
+            print(f"[RFDETRNano] Failed to decompress model: {e}")
+            # Clean up partial file if it exists
+            if os.path.exists(output_path):
+                os.remove(output_path)
+            return False
 
     def _load_pytorch_model(self):
         """Load the PyTorch RF-DETR model."""
