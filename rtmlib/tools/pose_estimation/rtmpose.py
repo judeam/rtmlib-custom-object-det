@@ -49,63 +49,6 @@ class RTMPose(BaseTool):
 
         return keypoints, scores
 
-    def _batch_inference(self, batch: np.ndarray):
-        """Run inference on entire batch at once.
-
-        Args:
-            batch: Batched input images of shape (N, 3, H, W)
-
-        Returns:
-            Model outputs (batched)
-        """
-        batch = np.ascontiguousarray(batch, dtype=np.float32)
-
-        if self.backend == 'opencv':
-            outNames = self.session.getUnconnectedOutLayersNames()
-            self.session.setInput(batch)
-            outputs = self.session.forward(outNames)
-        elif self.backend == 'onnxruntime':
-            sess_input = {self.session.get_inputs()[0].name: batch}
-            sess_output = [out.name for out in self.session.get_outputs()]
-            outputs = self.session.run(sess_output, sess_input)
-        elif self.backend == 'openvino':
-            results = self.compiled_model(batch)
-            output0 = results[self.output_layer0]
-            output1 = results[self.output_layer1]
-            outputs = [output0, output1]
-
-        return outputs
-
-    def _batch_postprocess(
-            self,
-            outputs: List[np.ndarray],
-            centers: np.ndarray,
-            scales: np.ndarray,
-            simcc_split_ratio: float = 2.0) -> Tuple[np.ndarray, np.ndarray]:
-        """Postprocess batched RTMPose model output.
-
-        Args:
-            outputs: Batched model outputs [simcc_x, simcc_y]
-            centers: Batch centers of shape (N, 2)
-            scales: Batch scales of shape (N, 2)
-            simcc_split_ratio: Split ratio of simcc
-
-        Returns:
-            keypoints: Batched keypoints of shape (N, K, 2)
-            scores: Batched scores of shape (N, K)
-        """
-        # Decode simcc (already batched from model)
-        simcc_x, simcc_y = outputs  # (N, K, Wx), (N, K, Wy)
-        locs, scores = get_simcc_maximum(simcc_x, simcc_y)  # Handles batch
-        keypoints = locs / simcc_split_ratio  # (N, K, 2)
-
-        # Vectorized rescaling: (N, K, 2) * (N, 1, 2) / (2,) + (N, 1, 2) - (N, 1, 2) / 2
-        model_size = np.array(self.model_input_size, dtype=np.float32)
-        keypoints = keypoints / model_size * scales[:, np.newaxis, :]
-        keypoints = keypoints + centers[:, np.newaxis, :] - scales[:, np.newaxis, :] / 2
-
-        return keypoints, scores
-
     def preprocess(self, img: np.ndarray, bbox: list):
         """Do preprocessing for RTMPose model inference.
 
