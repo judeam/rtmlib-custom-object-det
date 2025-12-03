@@ -1,2 +1,3 @@
 # Include model files
 recursive-include rtmlib/tools/models *.pt
+recursive-include rtmlib/tools/models *.pt.xz.part_*

@@ -110,7 +110,7 @@ if __name__ == '__main__':
           packages=find_packages(),
           include_package_data=True,
           package_data={
-              'rtmlib': ['tools/models/*.pt'],
+              'rtmlib': ['tools/models/*.pt', 'tools/models/*.pt.xz.part_*'],
           },
           url='https://github.com/Tau-J/rtmlib',
           license='Apache License 2.0',
