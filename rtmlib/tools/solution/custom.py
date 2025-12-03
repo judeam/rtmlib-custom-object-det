@@ -66,6 +66,8 @@ while cap.isOpened():
     cv2.waitKey(10)
 
 '''
+from typing import List, Tuple
+
 import numpy as np
 import importlib
 rtmlib_module = importlib.import_module("rtmlib")
@@ -155,3 +157,31 @@ class Custom:
             keypoints, scores = self.pose_model(image, bboxes=bboxes)
 
         return keypoints, scores
+
+    def predict_batch(self, images: List[np.ndarray]) -> List[Tuple[np.ndarray, np.ndarray]]:
+        """Run batch pose estimation on multiple images.
+
+        Args:
+            images: List of input images (BGR format from OpenCV)
+
+        Returns:
+            List of (keypoints, scores) tuples, one per image.
+        """
+        if self.one_stage:
+            # RTMO: sequential fallback (no batch support yet)
+            return [self.pose_model(img) for img in images]
+
+        # Two-stage: batch detection + per-frame pose
+        # Check if detector supports batch
+        if hasattr(self.det_model, 'predict_batch'):
+            all_bboxes = self.det_model.predict_batch(images)
+        else:
+            # Fallback for RTMDet or other detectors without batch support
+            all_bboxes = [self.det_model(img) for img in images]
+
+        results = []
+        for img, bboxes in zip(images, all_bboxes):
+            keypoints, scores = self.pose_model(img, bboxes=bboxes)
+            results.append((keypoints, scores))
+
+        return results

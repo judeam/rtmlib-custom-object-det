@@ -40,6 +40,8 @@ while cap.isOpened():
 
 '''
 
+from typing import List, Tuple
+
 import numpy as np
 
 class BodyWithFeet:
@@ -140,3 +142,27 @@ class BodyWithFeet:
         bboxes = self.det_model(image)
         keypoints, scores = self.pose_model(image, bboxes=bboxes)
         return keypoints, scores
+
+    def predict_batch(self, images: List[np.ndarray]) -> List[Tuple[np.ndarray, np.ndarray]]:
+        """Run batch pose estimation on multiple images.
+
+        Optimized for video processing with batch detection.
+
+        Args:
+            images: List of input images (BGR format from OpenCV)
+
+        Returns:
+            List of (keypoints, scores) tuples, one per image.
+            keypoints: shape (num_people, 26, 2) for Halpe26 format
+            scores: shape (num_people, 26)
+        """
+        # Batch detection for all frames at once
+        all_bboxes = self.det_model.predict_batch(images)
+
+        # Pose estimation per frame (batches people internally)
+        results = []
+        for img, bboxes in zip(images, all_bboxes):
+            keypoints, scores = self.pose_model(img, bboxes=bboxes)
+            results.append((keypoints, scores))
+
+        return results
