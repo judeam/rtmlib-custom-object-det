@@ -1,13 +1,16 @@
 numpy
-onnxruntime
 opencv-contrib-python
 opencv-python
 tqdm
 supervision
 torch
-rfdetr @ git+https://github.com/jude-mingay-bps/rf-detr-tensorrt-batch.git   
-tensorrt 
-onnx
+rfdetr @ git+https://github.com/jude-mingay-bps/rf-detr-tensorrt-batch.git
+tensorrt
+onnxruntime
 onnxruntime-gpu
 onnxsim
-onnx-graphsurgeon
+
+# ONNX export - version constraints for compatibility
+# onnx-graphsurgeon 0.5+ requires onnx 1.15+ for bfloat16 support
+onnx>=1.15.0
+onnx-graphsurgeon>=0.5.0
