@@ -278,21 +278,46 @@ class PoseTracker:
         else:  # rtmo
             keypoints, scores = self.pose_model(image)
 
+        # Apply tracking using helper
+        tracked_kpts, tracked_scores, _ = self._process_frame_tracking(
+            keypoints, scores
+        )
+        return tracked_kpts, tracked_scores
+
+    def _process_frame_tracking(
+        self,
+        keypoints: np.ndarray,
+        scores: np.ndarray
+    ) -> Tuple[np.ndarray, np.ndarray, List[int]]:
+        """Apply tracking to a single frame's pose results.
+
+        This is the core tracking logic extracted for reuse in both
+        single-frame and batch processing modes.
+
+        Args:
+            keypoints: Pose keypoints from pose model, shape (N, J, 2)
+            scores: Confidence scores from pose model, shape (N, J)
+
+        Returns:
+            Tuple of (tracked_keypoints, tracked_scores, track_ids)
+        """
+        # Without tracking - just update bboxes for next frame
         if not self.tracking:
-            # Without tracking - just update bboxes for next frame
             bboxes_current_frame = []
             for kpts in keypoints:
                 bbox = pose_to_bbox(kpts)
                 bboxes_current_frame.append(bbox)
             self.bboxes_last_frame = bboxes_current_frame
             self.frame_cnt += 1
-            return keypoints, scores
+            # Return with sequential indices as dummy track IDs
+            track_ids = list(range(len(keypoints)))
+            return keypoints, scores, track_ids
 
-        # With tracking
+        # With tracking - empty detections
         if len(keypoints) == 0:
             self._age_tracks()
             self.frame_cnt += 1
-            return np.array([]), np.array([])
+            return np.array([]), np.array([]), []
 
         # Convert keypoints to bboxes
         current_bboxes = [pose_to_bbox(kpts) for kpts in keypoints]
@@ -353,9 +378,90 @@ class PoseTracker:
         self.frame_cnt += 1
 
         if len(tracked_keypoints) == 0:
-            return np.array([]), np.array([])
+            return np.array([]), np.array([]), []
 
-        return np.array(tracked_keypoints), np.array(tracked_scores)
+        return np.array(tracked_keypoints), np.array(tracked_scores), new_track_ids
+
+    def __call_batch__(
+        self,
+        images: List[np.ndarray]
+    ) -> List[Tuple[np.ndarray, np.ndarray]]:
+        """Batch process frames with optimized detection + sequential tracking.
+
+        Maximizes GPU throughput by batching detection across all frames
+        while maintaining tracking state sequentially. This provides
+        significant speedup over calling __call__ individually.
+
+        Args:
+            images: List of input images (BGR format from OpenCV).
+                All images should have the same dimensions for optimal
+                batch processing performance.
+
+        Returns:
+            List of (keypoints, scores) tuples, one per frame.
+                - keypoints: shape (num_people, num_joints, 2)
+                - scores: shape (num_people, num_joints)
+
+        Note:
+            Frames are processed in order. Tracking state persists across
+            the batch and continues from any previous __call__ or
+            __call_batch__ invocations. Call reset() to start fresh.
+        """
+        if not images:
+            return []
+
+        n_frames = len(images)
+
+        # RTMO single-stage model: no batch detection available
+        if self.det_model is None:
+            results = []
+            for image in images:
+                keypoints, scores = self.pose_model(image)
+                tracked_kpts, tracked_scores, _ = self._process_frame_tracking(
+                    keypoints, scores
+                )
+                results.append((tracked_kpts, tracked_scores))
+            return results
+
+        # Step 1: Determine which frames need detection based on det_frequency
+        detection_indices = []
+        for i in range(n_frames):
+            if (self.frame_cnt + i) % self.det_frequency == 0:
+                detection_indices.append(i)
+
+        # Force detection on first frame if cache is empty
+        if not self.bboxes_last_frame and 0 not in detection_indices:
+            detection_indices.insert(0, 0)
+
+        # Step 2: Batch detection (single GPU call for all detection frames)
+        detection_results = {}
+        if detection_indices:
+            det_frames = [images[i] for i in detection_indices]
+            batch_bboxes = self.det_model.predict_batch(det_frames)
+            detection_results = dict(zip(detection_indices, batch_bboxes))
+
+        # Step 3: Process each frame with pose estimation + tracking
+        results = []
+        cached_bboxes = self.bboxes_last_frame
+
+        for i, image in enumerate(images):
+            # Get bboxes for this frame
+            if i in detection_results:
+                bboxes = detection_results[i]
+                cached_bboxes = bboxes
+            else:
+                bboxes = cached_bboxes
+
+            # Pose estimation (batches people internally via TensorRT)
+            keypoints, scores = self.pose_model(image, bboxes=bboxes)
+
+            # Sequential tracking (preserves track state frame-by-frame)
+            tracked_kpts, tracked_scores, _ = self._process_frame_tracking(
+                keypoints, scores
+            )
+            results.append((tracked_kpts, tracked_scores))
+
+        return results
 
     def _match_detections(
         self,
