@@ -1,0 +1,18 @@
+# Optional dependencies for full functionality
+onnxruntime
+onnxruntime-gpu
+tqdm
+supervision
+
+# TensorRT support
+torch
+tensorrt
+
+# ONNX export - version constraints for compatibility
+# onnx-graphsurgeon 0.5+ is compatible with onnx 1.15+
+onnx>=1.15.0
+onnxsim
+onnx-graphsurgeon>=0.5.0
+
+# RF-DETR model with batch support
+rfdetr @ git+https://github.com/jude-mingay-bps/rf-detr-tensorrt-batch.git
