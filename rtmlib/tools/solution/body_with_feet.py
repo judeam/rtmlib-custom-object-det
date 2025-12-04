@@ -103,6 +103,8 @@ class BodyWithFeet:
         """
         from .. import RFDETRNano, RTMPose
 
+        print(f"[BodyWithFeet DEBUG] Received: backend={backend}, device={device}")
+
         if pose is None:
             pose = self.MODE[mode]['pose']
             pose_input_size = self.MODE[mode]['pose_input_size']
@@ -119,6 +121,7 @@ class BodyWithFeet:
                                     export_format='engine',
                                     batch_size=batch_size,
                                     use_cuda_graphs=use_cuda_graphs)
+        print(f"[BodyWithFeet DEBUG] After RFDETRNano, passing to RTMPose: backend={backend}")
         self.pose_model = RTMPose(pose,
                                   model_input_size=pose_input_size,
                                   to_openpose=to_openpose,
