@@ -12,5 +12,5 @@ onnxsim
 
 # ONNX export - version constraints for compatibility
 # onnx-graphsurgeon 0.5+ requires onnx 1.15+ for bfloat16 support
-onnx>=1.15.0
-onnx-graphsurgeon>=0.5.0
+onnx
+onnx-graphsurgeon

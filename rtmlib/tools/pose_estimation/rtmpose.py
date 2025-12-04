@@ -57,9 +57,13 @@ class RTMPose(BaseTool):
         self._batch_centers = None
         self._batch_scales = None
 
+        # Debug logging
+        print(f"[RTMPose DEBUG] Received: backend={backend}, device={device}")
+
         # For tensorrt backend, skip BaseTool init (it doesn't know tensorrt)
         # and handle everything ourselves
         if backend == 'tensorrt' and device == 'cuda':
+            print("[RTMPose DEBUG] Taking TensorRT path")
             # Download model if it's a URL (like BaseTool does)
             if onnx_model.startswith('http'):
                 onnx_model = download_checkpoint(onnx_model)
@@ -85,6 +89,7 @@ class RTMPose(BaseTool):
             # Initialize native TensorRT
             self._try_init_tensorrt()
         else:
+            print(f"[RTMPose DEBUG] Taking ONNX path (backend={backend}, device={device})")
             # Use standard BaseTool initialization for other backends
             super().__init__(onnx_model, model_input_size, mean, std, backend,
                              device)
