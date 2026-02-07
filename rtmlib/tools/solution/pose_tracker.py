@@ -53,7 +53,7 @@ while cap.isOpened():
     if not success:
         break
 
-    keypoints, scores = pose_tracker(frame)
+    keypoints, scores, bboxes = pose_tracker(frame)
 
     img_show = frame.copy()
 
@@ -257,16 +257,19 @@ class PoseTracker:
         if self.reid:
             self.reid.reset()
 
-    def __call__(self, image: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """Process a frame and return tracked keypoints.
+    def __call__(
+        self, image: np.ndarray
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Process a frame and return tracked keypoints and bounding boxes.
 
         Args:
             image: Input image (BGR format from OpenCV)
 
         Returns:
-            Tuple of (keypoints, scores) where:
+            Tuple of (keypoints, scores, bboxes) where:
                 keypoints: Shape (num_persons, num_joints, 2)
                 scores: Shape (num_persons, num_joints)
+                bboxes: Shape (num_persons, 4) in [x1, y1, x2, y2] format
         """
         # Run detection
         if self.det_model is not None:
@@ -279,16 +282,16 @@ class PoseTracker:
             keypoints, scores = self.pose_model(image)
 
         # Apply tracking using helper
-        tracked_kpts, tracked_scores, _ = self._process_frame_tracking(
-            keypoints, scores
+        tracked_kpts, tracked_scores, tracked_bboxes, _ = (
+            self._process_frame_tracking(keypoints, scores)
         )
-        return tracked_kpts, tracked_scores
+        return tracked_kpts, tracked_scores, tracked_bboxes
 
     def _process_frame_tracking(
         self,
         keypoints: np.ndarray,
         scores: np.ndarray
-    ) -> Tuple[np.ndarray, np.ndarray, List[int]]:
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[int]]:
         """Apply tracking to a single frame's pose results.
 
         This is the core tracking logic extracted for reuse in both
@@ -299,7 +302,7 @@ class PoseTracker:
             scores: Confidence scores from pose model, shape (N, J)
 
         Returns:
-            Tuple of (tracked_keypoints, tracked_scores, track_ids)
+            Tuple of (tracked_keypoints, tracked_scores, tracked_bboxes, track_ids)
         """
         # Without tracking - just update bboxes for next frame
         if not self.tracking:
@@ -311,13 +314,14 @@ class PoseTracker:
             self.frame_cnt += 1
             # Return with sequential indices as dummy track IDs
             track_ids = list(range(len(keypoints)))
-            return keypoints, scores, track_ids
+            bboxes_arr = np.array(bboxes_current_frame) if bboxes_current_frame else np.array([])
+            return keypoints, scores, bboxes_arr, track_ids
 
         # With tracking - empty detections
         if len(keypoints) == 0:
             self._age_tracks()
             self.frame_cnt += 1
-            return np.array([]), np.array([]), []
+            return np.array([]), np.array([]), np.array([]), []
 
         # Convert keypoints to bboxes
         current_bboxes = [pose_to_bbox(kpts) for kpts in keypoints]
@@ -378,14 +382,19 @@ class PoseTracker:
         self.frame_cnt += 1
 
         if len(tracked_keypoints) == 0:
-            return np.array([]), np.array([]), []
+            return np.array([]), np.array([]), np.array([]), []
 
-        return np.array(tracked_keypoints), np.array(tracked_scores), new_track_ids
+        return (
+            np.array(tracked_keypoints),
+            np.array(tracked_scores),
+            np.array(new_bboxes),
+            new_track_ids,
+        )
 
     def __call_batch__(
         self,
         images: List[np.ndarray]
-    ) -> List[Tuple[np.ndarray, np.ndarray]]:
+    ) -> List[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
         """Batch process frames with optimized detection + sequential tracking.
 
         Maximizes GPU throughput by batching detection across all frames
@@ -398,9 +407,10 @@ class PoseTracker:
                 batch processing performance.
 
         Returns:
-            List of (keypoints, scores) tuples, one per frame.
+            List of (keypoints, scores, bboxes) tuples, one per frame.
                 - keypoints: shape (num_people, num_joints, 2)
                 - scores: shape (num_people, num_joints)
+                - bboxes: shape (num_people, 4) in [x1, y1, x2, y2] format
 
         Note:
             Frames are processed in order. Tracking state persists across
@@ -417,10 +427,10 @@ class PoseTracker:
             results = []
             for image in images:
                 keypoints, scores = self.pose_model(image)
-                tracked_kpts, tracked_scores, _ = self._process_frame_tracking(
-                    keypoints, scores
+                tracked_kpts, tracked_scores, tracked_bboxes, _ = (
+                    self._process_frame_tracking(keypoints, scores)
                 )
-                results.append((tracked_kpts, tracked_scores))
+                results.append((tracked_kpts, tracked_scores, tracked_bboxes))
             return results
 
         # Step 1: Determine which frames need detection based on det_frequency
@@ -456,10 +466,10 @@ class PoseTracker:
             keypoints, scores = self.pose_model(image, bboxes=bboxes)
 
             # Sequential tracking (preserves track state frame-by-frame)
-            tracked_kpts, tracked_scores, _ = self._process_frame_tracking(
-                keypoints, scores
+            tracked_kpts, tracked_scores, tracked_bboxes, _ = (
+                self._process_frame_tracking(keypoints, scores)
             )
-            results.append((tracked_kpts, tracked_scores))
+            results.append((tracked_kpts, tracked_scores, tracked_bboxes))
 
         return results
 
