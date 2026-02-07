@@ -141,12 +141,13 @@ class BodyWithFeet:
             tuple: A tuple containing:
                 - keypoints (np.ndarray): Estimated keypoint coordinates.
                 - scores (np.ndarray): Confidence scores for each keypoint.
+                - bboxes (np.ndarray): Bounding boxes in [x1, y1, x2, y2] format.
         """
         bboxes = self.det_model(image)
         keypoints, scores = self.pose_model(image, bboxes=bboxes)
-        return keypoints, scores
+        return keypoints, scores, bboxes
 
-    def predict_batch(self, images: List[np.ndarray]) -> List[Tuple[np.ndarray, np.ndarray]]:
+    def predict_batch(self, images: List[np.ndarray]) -> List[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
         """Run batch pose estimation on multiple images.
 
         Optimized for video processing with batch detection.
@@ -155,9 +156,10 @@ class BodyWithFeet:
             images: List of input images (BGR format from OpenCV)
 
         Returns:
-            List of (keypoints, scores) tuples, one per image.
+            List of (keypoints, scores, bboxes) tuples, one per image.
             keypoints: shape (num_people, 26, 2) for Halpe26 format
             scores: shape (num_people, 26)
+            bboxes: shape (num_people, 4) in [x1, y1, x2, y2] format
         """
         # Batch detection for all frames at once
         all_bboxes = self.det_model.predict_batch(images)
@@ -166,6 +168,6 @@ class BodyWithFeet:
         results = []
         for img, bboxes in zip(images, all_bboxes):
             keypoints, scores = self.pose_model(img, bboxes=bboxes)
-            results.append((keypoints, scores))
+            results.append((keypoints, scores, bboxes))
 
         return results
