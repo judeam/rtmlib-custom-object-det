@@ -67,20 +67,13 @@ while cap.isOpened():
     cv2.imshow('img', img_show)
     cv2.waitKey(10)
 '''
-from typing import Dict, List, Optional, Tuple
+from typing import List, Tuple
 
 import numpy as np
+import torch
 
-from .tracking import (
-    compute_iou,
-    compute_iou_matrix,
-    hungarian_matching,
-    distance_matching,
-    VelocityTracker,
-    TeleportationDetector,
-    TrackReidentifier,
-    SCIPY_AVAILABLE
-)
+from .tracking.algorithms import compute_iou_matrix
+from ocsort.ocsort import OCSort
 
 
 def pose_to_bbox(keypoints: np.ndarray, expansion: float = 1.25) -> np.ndarray:
@@ -105,21 +98,17 @@ def pose_to_bbox(keypoints: np.ndarray, expansion: float = 1.25) -> np.ndarray:
 
 
 class PoseTracker:
-    """Pose tracker for multi-person pose estimation with enhanced tracking.
+    """Pose tracker using OC-SORT for multi-person tracking.
 
-    Features:
-    - Hungarian algorithm for optimal bbox assignment (reduces ID switches)
-    - Velocity prediction for better occlusion handling
-    - Position smoothing to reduce trajectory jitter
-    - Teleportation detection to reject unrealistic jumps
-    - Track re-identification to recover lost tracks
-    - Batch processing for multi-person pose estimation
+    Uses OC-SORT (Observation-Centric SORT) which provides:
+    - Kalman filter motion modeling
+    - Observation-Centric Momentum (OCM) for velocity direction consistency
+    - Observation-Centric Recovery (OCR) for recovering lost tracks
 
     Args:
         solution (type): rtmlib solutions, e.g. Wholebody, Body, Custom, etc.
         det_frequency (int): Frequency of object detection.
         tracking (bool): Whether to enable tracking.
-        tracking_thr (float): IoU threshold for track matching.
         mode (str): 'performance', 'lightweight', or 'balanced'.
         to_openpose (bool): Whether to use openpose-style skeleton.
         backend (str): Backend of pose estimation model.
@@ -127,26 +116,20 @@ class PoseTracker:
         batch_size (int): Batch size for detection model.
         pose_batch_size (int): Batch size for pose model (max people per inference).
         use_cuda_graphs (bool): Enable CUDA graphs for kernel replay optimization.
-        use_hungarian (bool): Use Hungarian algorithm for optimal matching.
-        velocity_prediction (bool): Enable velocity-based prediction.
-        velocity_alpha (float): EMA weight for velocity smoothing (0.0-1.0).
-        position_smoothing (bool): Enable position smoothing to reduce jitter.
-        smoothing_alpha (float): EMA weight for position smoothing (0.0-1.0).
-        teleport_detection (bool): Enable teleportation detection.
-        max_teleport_factor (float): Max movement as multiple of bbox size.
-        enable_reid (bool): Enable track re-identification.
-        reid_max_frames (int): Max frames to recover a lost track.
-        reid_max_tracks (int): Max terminated tracks to store for recovery.
-        max_age (int): Max frames to keep track alive without detection.
+        det_thresh (float): Min confidence for OC-SORT high-confidence detections.
+        max_age (int): Max frames to coast lost tracks.
+        min_hits (int): Min hits before track appears (1 = immediate).
+        iou_threshold (float): IoU threshold for matching.
+        delta_t (int): OCM velocity direction window.
+        inertia (float): OCM inertia weight.
+        use_byte (bool): ByteTrack-style second matching pass.
     """
-    MIN_AREA = 1000
 
     def __init__(
         self,
         solution: type,
         det_frequency: int = 1,
         tracking: bool = True,
-        tracking_thr: float = 0.3,
         mode: str = 'balanced',
         to_openpose: bool = False,
         backend: str = 'onnxruntime',
@@ -155,18 +138,14 @@ class PoseTracker:
         batch_size: int = 1,
         pose_batch_size: int = 8,
         use_cuda_graphs: bool = True,
-        # Enhanced tracking options (all backward compatible with defaults)
-        use_hungarian: bool = True,
-        velocity_prediction: bool = True,
-        velocity_alpha: float = 0.8,
-        position_smoothing: bool = True,
-        smoothing_alpha: float = 0.85,
-        teleport_detection: bool = True,
-        max_teleport_factor: float = 3.0,
-        enable_reid: bool = False,
-        reid_max_frames: int = 60,
-        reid_max_tracks: int = 10,
-        max_age: int = 30
+        # OC-SORT parameters
+        det_thresh: float = 0.3,
+        max_age: int = 30,
+        min_hits: int = 1,
+        iou_threshold: float = 0.3,
+        delta_t: int = 3,
+        inertia: float = 0.2,
+        use_byte: bool = False,
     ):
         # Try to pass batch params if solution supports them
         try:
@@ -192,70 +171,28 @@ class PoseTracker:
 
         self.det_frequency = det_frequency
         self.tracking = tracking
-        self.tracking_thr = tracking_thr
-        self.max_age = max_age
 
-        # Enhanced tracking options
-        self.use_hungarian = use_hungarian and SCIPY_AVAILABLE
-        self.velocity_prediction = velocity_prediction
-        self.position_smoothing = position_smoothing
-        self.teleport_detection = teleport_detection
-        self.enable_reid = enable_reid
-
-        # Initialize tracking components
-        self.velocity_tracker = VelocityTracker(
-            velocity_alpha=velocity_alpha,
-            smoothing_alpha=smoothing_alpha
-        ) if (velocity_prediction or position_smoothing) else None
-
-        self.teleport_detector = TeleportationDetector(
-            max_displacement_factor=max_teleport_factor
-        ) if teleport_detection else None
-
-        self.reid = TrackReidentifier(
-            max_recovery_frames=reid_max_frames,
-            max_tracks=reid_max_tracks
-        ) if enable_reid else None
+        self._ocsort_config = dict(
+            det_thresh=det_thresh,
+            max_age=max_age,
+            min_hits=min_hits,
+            iou_threshold=iou_threshold,
+            delta_t=delta_t,
+            inertia=inertia,
+            use_byte=use_byte,
+        )
 
         self.reset()
 
         if self.tracking:
-            features = []
-            if self.use_hungarian:
-                features.append("Hungarian matching")
-            if velocity_prediction:
-                features.append("velocity prediction")
-            if position_smoothing:
-                features.append("position smoothing")
-            if teleport_detection:
-                features.append("teleportation detection")
-            if enable_reid:
-                features.append("track re-identification")
-
-            if features:
-                print(f'Enhanced tracking enabled: {", ".join(features)}')
-            else:
-                print('Basic tracking enabled (greedy IoU matching)')
+            print('OC-SORT tracking enabled')
 
     def reset(self):
         """Reset pose tracker state."""
         self.frame_cnt = 0
-        self.next_id = 0
-
-        # Track state
-        self.active_tracks: Dict[int, np.ndarray] = {}  # track_id -> bbox
-        self.track_ages: Dict[int, int] = {}  # track_id -> frames since last seen
-        self.track_keypoints: Dict[int, np.ndarray] = {}  # track_id -> last keypoints
-
-        # Legacy compatibility
-        self.bboxes_last_frame: List[np.ndarray] = []
-        self.track_ids_last_frame: List[int] = []
-
-        # Reset components
-        if self.velocity_tracker:
-            self.velocity_tracker.reset()
-        if self.reid:
-            self.reid.reset()
+        if self.tracking:
+            self._tracker = OCSort(**self._ocsort_config)
+        self.bboxes_last_frame = []
 
     def __call__(
         self, image: np.ndarray
@@ -281,7 +218,7 @@ class PoseTracker:
         else:  # rtmo
             keypoints, scores = self.pose_model(image)
 
-        # Apply tracking using helper
+        # Apply tracking
         tracked_kpts, tracked_scores, tracked_bboxes, _ = (
             self._process_frame_tracking(keypoints, scores)
         )
@@ -292,10 +229,7 @@ class PoseTracker:
         keypoints: np.ndarray,
         scores: np.ndarray
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[int]]:
-        """Apply tracking to a single frame's pose results.
-
-        This is the core tracking logic extracted for reuse in both
-        single-frame and batch processing modes.
+        """Apply OC-SORT tracking to a single frame's pose results.
 
         Args:
             keypoints: Pose keypoints from pose model, shape (N, J, 2)
@@ -312,73 +246,69 @@ class PoseTracker:
                 bboxes_current_frame.append(bbox)
             self.bboxes_last_frame = bboxes_current_frame
             self.frame_cnt += 1
-            # Return with sequential indices as dummy track IDs
             track_ids = list(range(len(keypoints)))
             bboxes_arr = np.array(bboxes_current_frame) if bboxes_current_frame else np.array([])
             return keypoints, scores, bboxes_arr, track_ids
 
-        # With tracking - empty detections
+        # Empty detections - still call tracker to advance state
         if len(keypoints) == 0:
-            self._age_tracks()
+            self._tracker.update(torch.empty((0, 6)), None)
+            self.bboxes_last_frame = []
             self.frame_cnt += 1
             return np.array([]), np.array([]), np.array([]), []
 
         # Convert keypoints to bboxes
-        current_bboxes = [pose_to_bbox(kpts) for kpts in keypoints]
+        original_bboxes = np.array([pose_to_bbox(kpts) for kpts in keypoints])
 
-        # Match current detections to existing tracks
-        track_assignments = self._match_detections(current_bboxes)
+        # Compute per-person confidence as mean of joint scores
+        confidences = np.mean(scores, axis=1)
 
-        # Build output ordered by track ID
+        # Build OC-SORT input: [x1, y1, x2, y2, confidence, class]
+        classes = np.zeros(len(keypoints))
+        dets = np.column_stack([original_bboxes, confidences, classes]).astype(np.float32)
+
+        # OC-SORT expects torch tensors
+        tracks = self._tracker.update(torch.from_numpy(dets), None)
+
+        if len(tracks) == 0:
+            self.bboxes_last_frame = []
+            self.frame_cnt += 1
+            return np.array([]), np.array([]), np.array([]), []
+
+        # Extract tracked bboxes and IDs
+        tracked_bboxes = tracks[:, :4]
+        track_ids = tracks[:, 4].astype(int).tolist()
+
+        # Map tracked bboxes back to original keypoints via IoU
+        iou_matrix = compute_iou_matrix(
+            list(tracked_bboxes), list(original_bboxes)
+        )
+
         tracked_keypoints = []
         tracked_scores = []
-        new_track_ids = []
-        new_bboxes = []
+        final_bboxes = []
+        final_track_ids = []
+        used_dets = set()
 
-        for det_idx, (kpts, score, bbox) in enumerate(
-            zip(keypoints, scores, current_bboxes)
-        ):
-            track_id = track_assignments.get(det_idx, -1)
+        for track_idx in range(len(tracks)):
+            # Find best matching detection for this track (greedy)
+            best_det_idx = -1
+            best_iou = -1.0
+            for det_idx in range(len(original_bboxes)):
+                if det_idx in used_dets:
+                    continue
+                if iou_matrix[track_idx, det_idx] > best_iou:
+                    best_iou = iou_matrix[track_idx, det_idx]
+                    best_det_idx = det_idx
 
-            if track_id == -1:
-                # Unmatched detection - try ReID or create new track
-                if self.enable_reid and self.reid:
-                    track_id = self.reid.try_recover(bbox, self.frame_cnt)
+            if best_det_idx >= 0:
+                used_dets.add(best_det_idx)
+                tracked_keypoints.append(keypoints[best_det_idx])
+                tracked_scores.append(scores[best_det_idx])
+                final_bboxes.append(tracked_bboxes[track_idx])
+                final_track_ids.append(track_ids[track_idx])
 
-                if track_id == -1:
-                    # Check minimum area
-                    area = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
-                    if area >= self.MIN_AREA:
-                        track_id = self.next_id
-                        self.next_id += 1
-
-            if track_id >= 0:
-                # Update track state
-                old_bbox = self.active_tracks.get(track_id)
-
-                # Apply position smoothing if enabled
-                if self.position_smoothing and self.velocity_tracker and old_bbox is not None:
-                    bbox = self.velocity_tracker.smooth(track_id, bbox, old_bbox)
-
-                # Update velocity if enabled
-                if self.velocity_prediction and self.velocity_tracker and old_bbox is not None:
-                    self.velocity_tracker.update(track_id, old_bbox, bbox)
-
-                self.active_tracks[track_id] = bbox
-                self.track_ages[track_id] = 0
-                self.track_keypoints[track_id] = kpts
-
-                tracked_keypoints.append(kpts)
-                tracked_scores.append(score)
-                new_track_ids.append(track_id)
-                new_bboxes.append(bbox)
-
-        # Age and remove old tracks
-        self._age_tracks()
-
-        # Update state for next frame
-        self.track_ids_last_frame = new_track_ids
-        self.bboxes_last_frame = new_bboxes
+        self.bboxes_last_frame = final_bboxes
         self.frame_cnt += 1
 
         if len(tracked_keypoints) == 0:
@@ -387,8 +317,8 @@ class PoseTracker:
         return (
             np.array(tracked_keypoints),
             np.array(tracked_scores),
-            np.array(new_bboxes),
-            new_track_ids,
+            np.array(final_bboxes),
+            final_track_ids,
         )
 
     def __call_batch__(
@@ -397,25 +327,11 @@ class PoseTracker:
     ) -> List[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
         """Batch process frames with optimized detection + sequential tracking.
 
-        Maximizes GPU throughput by batching detection across all frames
-        while maintaining tracking state sequentially. This provides
-        significant speedup over calling __call__ individually.
-
         Args:
             images: List of input images (BGR format from OpenCV).
-                All images should have the same dimensions for optimal
-                batch processing performance.
 
         Returns:
             List of (keypoints, scores, bboxes) tuples, one per frame.
-                - keypoints: shape (num_people, num_joints, 2)
-                - scores: shape (num_people, num_joints)
-                - bboxes: shape (num_people, 4) in [x1, y1, x2, y2] format
-
-        Note:
-            Frames are processed in order. Tracking state persists across
-            the batch and continues from any previous __call__ or
-            __call_batch__ invocations. Call reset() to start fresh.
         """
         if not images:
             return []
@@ -452,17 +368,15 @@ class PoseTracker:
 
         # Step 3: Process each frame with pose estimation + tracking
         results = []
-        cached_bboxes = self.bboxes_last_frame
 
         for i, image in enumerate(images):
-            # Get bboxes for this frame
+            # Get bboxes: fresh detection or Kalman-smoothed from last frame
             if i in detection_results:
                 bboxes = detection_results[i]
-                cached_bboxes = bboxes
             else:
-                bboxes = cached_bboxes
+                bboxes = self.bboxes_last_frame
 
-            # Pose estimation (batches people internally via TensorRT)
+            # Pose estimation
             keypoints, scores = self.pose_model(image, bboxes=bboxes)
 
             # Sequential tracking (preserves track state frame-by-frame)
@@ -472,208 +386,3 @@ class PoseTracker:
             results.append((tracked_kpts, tracked_scores, tracked_bboxes))
 
         return results
-
-    def _match_detections(
-        self,
-        current_bboxes: List[np.ndarray]
-    ) -> Dict[int, int]:
-        """Match current detections to existing tracks.
-
-        Args:
-            current_bboxes: List of current detection bboxes
-
-        Returns:
-            Dict mapping detection index to track_id
-        """
-        if not self.active_tracks:
-            return {}
-
-        # Get previous track bboxes (with optional velocity prediction)
-        prev_track_ids = list(self.active_tracks.keys())
-        prev_bboxes = []
-
-        for track_id in prev_track_ids:
-            bbox = self.active_tracks[track_id]
-
-            # Apply velocity prediction for tracks that weren't seen recently
-            if (self.velocity_prediction and
-                self.velocity_tracker and
-                self.track_ages.get(track_id, 0) > 0):
-                frame_delta = self.track_ages[track_id]
-                bbox = self.velocity_tracker.predict(track_id, bbox, frame_delta)
-
-            prev_bboxes.append(bbox)
-
-        # Compute matching
-        if self.use_hungarian:
-            matches, unmatched_prev, unmatched_curr = hungarian_matching(
-                compute_iou_matrix(prev_bboxes, current_bboxes),
-                min_iou=self.tracking_thr
-            )
-        else:
-            # Fallback to greedy matching (original behavior)
-            matches, unmatched_prev, unmatched_curr = self._greedy_match(
-                prev_bboxes, current_bboxes
-            )
-
-        # Filter teleporting matches
-        if self.teleport_detection and self.teleport_detector:
-            valid_matches = []
-            for prev_idx, curr_idx in matches:
-                prev_bbox = self.active_tracks[prev_track_ids[prev_idx]]
-                curr_bbox = current_bboxes[curr_idx]
-
-                if self.teleport_detector.validate_match(prev_bbox, curr_bbox):
-                    valid_matches.append((prev_idx, curr_idx))
-                else:
-                    unmatched_prev.append(prev_idx)
-                    unmatched_curr.append(curr_idx)
-
-            matches = valid_matches
-
-        # Try distance-based matching for unmatched tracks (fallback)
-        if unmatched_prev and unmatched_curr and self.use_hungarian:
-            remaining_prev_bboxes = [prev_bboxes[i] for i in unmatched_prev]
-            remaining_curr_bboxes = [current_bboxes[i] for i in unmatched_curr]
-
-            dist_matches, _, _ = distance_matching(
-                remaining_prev_bboxes,
-                remaining_curr_bboxes,
-                max_distance=100.0  # pixels
-            )
-
-            # Add distance matches to main matches
-            for local_prev, local_curr in dist_matches:
-                global_prev = unmatched_prev[local_prev]
-                global_curr = unmatched_curr[local_curr]
-
-                # Validate teleportation for distance matches too
-                if self.teleport_detection and self.teleport_detector:
-                    prev_bbox = self.active_tracks[prev_track_ids[global_prev]]
-                    curr_bbox = current_bboxes[global_curr]
-                    if not self.teleport_detector.validate_match(prev_bbox, curr_bbox):
-                        continue
-
-                matches.append((global_prev, global_curr))
-
-        # Build assignment dict
-        assignments: Dict[int, int] = {}
-        for prev_idx, curr_idx in matches:
-            track_id = prev_track_ids[prev_idx]
-            assignments[curr_idx] = track_id
-
-        return assignments
-
-    def _greedy_match(
-        self,
-        prev_bboxes: List[np.ndarray],
-        curr_bboxes: List[np.ndarray]
-    ) -> Tuple[List[Tuple[int, int]], List[int], List[int]]:
-        """Greedy IoU matching (original algorithm).
-
-        Args:
-            prev_bboxes: Previous frame bboxes
-            curr_bboxes: Current frame bboxes
-
-        Returns:
-            (matches, unmatched_prev, unmatched_curr)
-        """
-        matches = []
-        matched_prev = set()
-        matched_curr = set()
-
-        for curr_idx, curr_bbox in enumerate(curr_bboxes):
-            best_iou = -1
-            best_prev_idx = -1
-
-            for prev_idx, prev_bbox in enumerate(prev_bboxes):
-                if prev_idx in matched_prev:
-                    continue
-
-                iou = compute_iou(prev_bbox, curr_bbox)
-                if iou > best_iou:
-                    best_iou = iou
-                    best_prev_idx = prev_idx
-
-            if best_iou >= self.tracking_thr and best_prev_idx >= 0:
-                matches.append((best_prev_idx, curr_idx))
-                matched_prev.add(best_prev_idx)
-                matched_curr.add(curr_idx)
-
-        unmatched_prev = [i for i in range(len(prev_bboxes)) if i not in matched_prev]
-        unmatched_curr = [i for i in range(len(curr_bboxes)) if i not in matched_curr]
-
-        return matches, unmatched_prev, unmatched_curr
-
-    def _age_tracks(self):
-        """Age tracks and remove/store old ones."""
-        to_remove = []
-
-        for track_id in self.active_tracks:
-            self.track_ages[track_id] = self.track_ages.get(track_id, 0) + 1
-
-            if self.track_ages[track_id] > self.max_age:
-                to_remove.append(track_id)
-
-        for track_id in to_remove:
-            # Store for potential re-identification
-            if self.enable_reid and self.reid and self.velocity_tracker:
-                velocity = self.velocity_tracker.get_velocity(track_id) or (0, 0)
-                self.reid.store(
-                    track_id=track_id,
-                    last_bbox=self.active_tracks[track_id],
-                    last_velocity=velocity,
-                    frame_id=self.frame_cnt,
-                    last_keypoints=self.track_keypoints.get(track_id)
-                )
-
-            # Remove from active tracking
-            del self.active_tracks[track_id]
-            del self.track_ages[track_id]
-            self.track_keypoints.pop(track_id, None)
-
-            if self.velocity_tracker:
-                self.velocity_tracker.remove_track(track_id)
-
-    def get_track_info(self) -> dict:
-        """Get current tracking statistics.
-
-        Returns:
-            Dict with tracking information
-        """
-        return {
-            'active_tracks': len(self.active_tracks),
-            'next_id': self.next_id,
-            'frame_count': self.frame_cnt,
-            'terminated_tracks': self.reid.get_stored_count() if self.reid else 0,
-            'track_ages': dict(self.track_ages),
-        }
-
-    # Legacy compatibility method
-    def track_by_iou(self, bbox: np.ndarray) -> Tuple[int, Optional[np.ndarray]]:
-        """Legacy method for backward compatibility.
-
-        Use the new tracking system via __call__ instead.
-        """
-        area = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
-
-        max_iou_score = -1
-        max_index = -1
-        match_result = None
-
-        for index, each_bbox in enumerate(self.bboxes_last_frame):
-            iou_score = compute_iou(bbox, each_bbox)
-            if iou_score > max_iou_score:
-                max_iou_score = iou_score
-                max_index = index
-
-        if max_iou_score > self.tracking_thr:
-            track_id = self.track_ids_last_frame.pop(max_index)
-            match_result = self.bboxes_last_frame.pop(max_index)
-        elif area >= self.MIN_AREA:
-            track_id = self.next_id
-            self.next_id += 1
-        else:
-            track_id = -1
-
-        return track_id, match_result

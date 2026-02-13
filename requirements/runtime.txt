@@ -1,3 +1,4 @@
 # Core runtime dependencies
 numpy
 opencv-python
+ocsort

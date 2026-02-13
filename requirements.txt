@@ -9,6 +9,7 @@ tensorrt
 onnxruntime
 onnxruntime-gpu
 onnxsim
+ocsort
 
 # ONNX export - version constraints for compatibility
 # onnx-graphsurgeon 0.5+ requires onnx 1.15+ for bfloat16 support
