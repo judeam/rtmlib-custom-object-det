@@ -19,7 +19,6 @@ from .algorithms import (
 from .velocity import VelocityTracker
 from .teleportation import TeleportationDetector
 from .reid import TrackReidentifier, TerminatedTrack
-from .static_filter import StaticTrackFilter
 
 __all__ = [
     # Algorithms
@@ -36,6 +35,4 @@ __all__ = [
     # Re-identification
     'TrackReidentifier',
     'TerminatedTrack',
-    # Static track filtering
-    'StaticTrackFilter',
 ]

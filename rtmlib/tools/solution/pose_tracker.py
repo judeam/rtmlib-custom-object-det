@@ -79,7 +79,6 @@ from .tracking import (
     VelocityTracker,
     TeleportationDetector,
     TrackReidentifier,
-    StaticTrackFilter,
     SCIPY_AVAILABLE
 )
 
@@ -167,13 +166,7 @@ class PoseTracker:
         enable_reid: bool = False,
         reid_max_frames: int = 60,
         reid_max_tracks: int = 10,
-        max_age: int = 30,
-        # Static track filtering (billboard/background suppression)
-        filter_static: bool = True,
-        static_confirmation_frames: int = 30,
-        static_min_displacement: float = 50.0,
-        static_variance_window: int = 60,
-        static_min_variance: float = 0.5,
+        max_age: int = 30
     ):
         # Try to pass batch params if solution supports them
         try:
@@ -224,14 +217,6 @@ class PoseTracker:
             max_tracks=reid_max_tracks
         ) if enable_reid else None
 
-        self.filter_static = filter_static
-        self.static_filter = StaticTrackFilter(
-            confirmation_frames=static_confirmation_frames,
-            min_residual_displacement=static_min_displacement,
-            variance_window=static_variance_window,
-            min_velocity_variance=static_min_variance,
-        ) if filter_static else None
-
         self.reset()
 
         if self.tracking:
@@ -246,8 +231,6 @@ class PoseTracker:
                 features.append("teleportation detection")
             if enable_reid:
                 features.append("track re-identification")
-            if filter_static:
-                features.append("static track filtering")
 
             if features:
                 print(f'Enhanced tracking enabled: {", ".join(features)}')
@@ -273,8 +256,6 @@ class PoseTracker:
             self.velocity_tracker.reset()
         if self.reid:
             self.reid.reset()
-        if hasattr(self, 'static_filter') and self.static_filter:
-            self.static_filter.reset()
 
     def __call__(
         self, image: np.ndarray
@@ -394,36 +375,6 @@ class PoseTracker:
 
         # Age and remove old tracks
         self._age_tracks()
-
-        # --- Static track filtering: suppress tentative/static tracks ---
-        if self.filter_static and self.static_filter and new_track_ids:
-            # Build bbox dict for all tracks that were updated this frame
-            frame_bboxes = {
-                tid: bbox for tid, bbox in zip(new_track_ids, new_bboxes)
-            }
-            suppress_ids = self.static_filter.update(frame_bboxes)
-
-            if suppress_ids:
-                kept = [
-                    (kp, sc, tid, bb)
-                    for kp, sc, tid, bb in zip(
-                        tracked_keypoints, tracked_scores,
-                        new_track_ids, new_bboxes
-                    )
-                    if tid not in suppress_ids
-                ]
-                if kept:
-                    tracked_keypoints, tracked_scores, new_track_ids, new_bboxes = (
-                        [x[0] for x in kept],
-                        [x[1] for x in kept],
-                        [x[2] for x in kept],
-                        [x[3] for x in kept],
-                    )
-                else:
-                    tracked_keypoints = []
-                    tracked_scores = []
-                    new_track_ids = []
-                    new_bboxes = []
 
         # Update state for next frame
         self.track_ids_last_frame = new_track_ids
@@ -665,10 +616,8 @@ class PoseTracker:
                 to_remove.append(track_id)
 
         for track_id in to_remove:
-            # Store for potential re-identification (skip static tracks)
-            is_static = (self.static_filter and
-                         self.static_filter.is_static(track_id))
-            if self.enable_reid and self.reid and self.velocity_tracker and not is_static:
+            # Store for potential re-identification
+            if self.enable_reid and self.reid and self.velocity_tracker:
                 velocity = self.velocity_tracker.get_velocity(track_id) or (0, 0)
                 self.reid.store(
                     track_id=track_id,
@@ -685,8 +634,6 @@ class PoseTracker:
 
             if self.velocity_tracker:
                 self.velocity_tracker.remove_track(track_id)
-            if self.static_filter:
-                self.static_filter.remove_track(track_id)
 
     def get_track_info(self) -> dict:
         """Get current tracking statistics.
