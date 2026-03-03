@@ -162,5 +162,10 @@ class BaseTool(metaclass=ABCMeta):
             output0 = results[self.output_layer0]
             output1 = results[self.output_layer1]
             outputs = [output0, output1]
+        else:
+            raise RuntimeError(
+                f"Unsupported backend '{self.backend}' for inference. "
+                f"Supported backends: opencv, onnxruntime, openvino"
+            )
 
         return outputs
