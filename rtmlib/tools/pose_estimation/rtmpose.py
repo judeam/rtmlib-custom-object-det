@@ -195,6 +195,23 @@ class RTMPose(BaseTool):
 
     # ==================== TensorRT Methods ====================
 
+    def _fallback_to_onnxruntime(self):
+        """Initialize ONNX Runtime session as fallback when TensorRT is unavailable."""
+        print("[RTMPose] Initializing ONNX Runtime fallback session...")
+        self.backend = 'onnxruntime'
+        self._trt_engine = None
+
+        import onnxruntime as ort
+        providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+        available = ort.get_available_providers()
+        providers = [p for p in providers if p in available]
+
+        self.session = ort.InferenceSession(
+            path_or_bytes=self.onnx_model_path,
+            providers=providers,
+        )
+        print(f"[RTMPose] ONNX Runtime fallback ready (providers={providers})")
+
     def _try_init_tensorrt(self):
         """Attempt TensorRT initialization with graceful fallback."""
         try:
@@ -202,7 +219,8 @@ class RTMPose(BaseTool):
             import torch
 
             if not torch.cuda.is_available():
-                print("[RTMPose] CUDA not available, using ONNX Runtime")
+                print("[RTMPose] CUDA not available, falling back to ONNX Runtime")
+                self._fallback_to_onnxruntime()
                 return
 
             engine_path = self._get_or_build_engine()
@@ -210,12 +228,15 @@ class RTMPose(BaseTool):
                 self._load_tensorrt_engine(engine_path)
                 print(f"[RTMPose] Using native TensorRT inference")
             else:
-                print("[RTMPose] TensorRT engine build failed, using ONNX Runtime")
+                print("[RTMPose] TensorRT engine build failed, falling back to ONNX Runtime")
+                self._fallback_to_onnxruntime()
 
         except ImportError as e:
-            print(f"[RTMPose] TensorRT/PyTorch not installed: {e}, using ONNX Runtime")
+            print(f"[RTMPose] TensorRT/PyTorch not installed: {e}, falling back to ONNX Runtime")
+            self._fallback_to_onnxruntime()
         except Exception as e:
-            print(f"[RTMPose] TensorRT init failed: {e}, using ONNX Runtime")
+            print(f"[RTMPose] TensorRT init failed: {e}, falling back to ONNX Runtime")
+            self._fallback_to_onnxruntime()
 
     def _get_or_build_engine(self) -> Optional[str]:
         """Get existing TensorRT engine or build a new one."""
@@ -356,6 +377,7 @@ class RTMPose(BaseTool):
             import traceback
             traceback.print_exc()
             self._trt_engine = None
+            self._fallback_to_onnxruntime()
 
     def _allocate_trt_buffers(self):
         """Allocate GPU buffers for TensorRT inference."""
