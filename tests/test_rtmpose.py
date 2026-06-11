@@ -96,8 +96,26 @@ class TestSimccDecodeParity:
         assert scores[0, 0] < 0
         ref_locs, _ = get_simcc_maximum(simcc_x, simcc_y)
         assert np.all(ref_locs[0, 0] == -1)
-        # Valid keypoint has positive mean score
-        assert scores[0, 1] == pytest.approx(2.0)
+        # Valid keypoint's raw mean is 2.0 but scores clamp to 1.0
+        assert scores[0, 1] == pytest.approx(1.0)
+
+    def test_scores_clamped_to_one(self):
+        """SimCC axis maxima can exceed 1; decoded scores must not."""
+        rng = np.random.default_rng(7)
+        n, k = 2, 26
+        # Large positive responses so unclamped means would exceed 1
+        simcc_x = rng.uniform(0.8, 1.6, size=(n, k, 384)).astype(np.float32)
+        simcc_y = rng.uniform(0.8, 1.6, size=(n, k, 512)).astype(np.float32)
+
+        pose = _bare_rtmpose(model_input_size=(192, 256))
+        centers = np.full((n, 2), 300.0, dtype=np.float32)
+        scales = np.full((n, 2), 200.0, dtype=np.float32)
+
+        _, scores = pose._postprocess_batch(simcc_x, simcc_y, centers, scales)
+        _, ref_vals = get_simcc_maximum(simcc_x, simcc_y)
+
+        assert scores.max() <= 1.0
+        assert ref_vals.max() <= 1.0
 
 
 class TestWarpMatToTheta:

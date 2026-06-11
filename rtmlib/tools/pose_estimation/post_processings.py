@@ -38,7 +38,9 @@ def get_simcc_maximum(simcc_x: np.ndarray,
     # get maximum value across x and y axis
     # mask = max_val_x > max_val_y
     # max_val_x[mask] = max_val_y[mask]
-    vals = 0.5 * (max_val_x + max_val_y)
+    # SimCC axis maxima are unnormalized and can each exceed 1; clamp so
+    # downstream consumers can treat scores as a [0, 1] confidence.
+    vals = np.minimum(0.5 * (max_val_x + max_val_y), 1.0)
     locs[vals <= 0.] = -1
 
     # reshape

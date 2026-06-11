@@ -633,8 +633,9 @@ class RTMPose(BaseTool):
         y_scores = np.take_along_axis(simcc_y, y_locs[:, :, None], axis=2).squeeze(2)
 
         # Match ONNX decode semantics (get_simcc_maximum): mean of the two
-        # axis maxima, with invalid (non-positive) responses masked to -1.
-        scores = 0.5 * (x_scores + y_scores)  # (N, 17)
+        # axis maxima clamped to 1.0, with invalid (non-positive) responses
+        # masked to -1.
+        scores = np.minimum(0.5 * (x_scores + y_scores), 1.0)  # (N, 17)
 
         # Stack to (N, 17, 2), mask invalid locations, apply split ratio
         locs = np.stack([x_locs, y_locs], axis=2).astype(np.float32)
