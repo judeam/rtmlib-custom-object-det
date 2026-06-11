@@ -106,7 +106,9 @@ class RTMPose(BaseTool):
 
     def __call__(self, image: np.ndarray, bboxes: list = []):
         if len(bboxes) == 0:
-            bboxes = [[0, 0, image.shape[1], image.shape[0]]]
+            # No detections: return empty results instead of fabricating a
+            # full-frame bbox (which produced a phantom person per frame).
+            return self._EMPTY_KEYPOINTS.copy(), self._EMPTY_SCORES.copy()
 
         # Route to TensorRT fast path if available
         if self._trt_engine is not None:
@@ -140,7 +142,8 @@ class RTMPose(BaseTool):
 
         Args:
             img (np.ndarray): Input image in shape.
-            bbox (list):  xyxy-format bounding box of target.
+            bbox (list):  xyxy-format bounding box of target. A trailing
+                detection score (xyxys) is tolerated and ignored.
 
         Returns:
             tuple:
@@ -148,7 +151,7 @@ class RTMPose(BaseTool):
             - center (np.ndarray): Center of image.
             - scale (np.ndarray): Scale of image.
         """
-        bbox = np.array(bbox)
+        bbox = np.array(bbox)[:4]
 
         # get center and scale
         center, scale = bbox_xyxy2cs(bbox, padding=1.25)
@@ -496,9 +499,15 @@ class RTMPose(BaseTool):
             if self._cuda_graph is not None and self._graph_captured:
                 self._cuda_graph.replay()
             else:
+                # The input copy_ above runs on the current stream while the
+                # engine executes on the private TRT stream: make the TRT
+                # stream wait for the copy, then sync so the outputs are
+                # complete before they are read below.
+                self._trt_stream.wait_stream(torch.cuda.current_stream())
                 self._trt_context.execute_async_v3(
                     stream_handle=self._trt_stream.cuda_stream
                 )
+                self._trt_stream.synchronize()
 
             # Get outputs (extract only valid results, not padding)
             output_names = list(self._trt_output_tensors.keys())
@@ -566,7 +575,8 @@ class RTMPose(BaseTool):
         """Vectorized center/scale computation for all bboxes.
 
         Args:
-            bboxes: (N, 4) array of xyxy bboxes
+            bboxes: (N, 4) array of xyxy bboxes; a trailing score column
+                (N, 5) is tolerated and ignored
             aspect_ratio: w/h of model input
 
         Returns:
@@ -621,10 +631,14 @@ class RTMPose(BaseTool):
         N, num_kpts = x_locs.shape
         x_scores = np.take_along_axis(simcc_x, x_locs[:, :, None], axis=2).squeeze(2)
         y_scores = np.take_along_axis(simcc_y, y_locs[:, :, None], axis=2).squeeze(2)
-        scores = np.minimum(x_scores, y_scores)  # (N, 17)
 
-        # Stack to (N, 17, 2) and apply split ratio
+        # Match ONNX decode semantics (get_simcc_maximum): mean of the two
+        # axis maxima, with invalid (non-positive) responses masked to -1.
+        scores = 0.5 * (x_scores + y_scores)  # (N, 17)
+
+        # Stack to (N, 17, 2), mask invalid locations, apply split ratio
         locs = np.stack([x_locs, y_locs], axis=2).astype(np.float32)
+        locs[scores <= 0.] = -1
         keypoints = locs / simcc_split_ratio
 
         # Rescale keypoints: keypoints / model_size * scale + center - scale/2
@@ -639,7 +653,7 @@ class RTMPose(BaseTool):
         import torch
         import torch.nn.functional as F
 
-        bbox = np.array(bbox)
+        bbox = np.array(bbox)[:4]
 
         # Get center and scale (CPU - fast matrix math)
         center, scale = bbox_xyxy2cs(bbox, padding=1.25)
@@ -711,17 +725,19 @@ class RTMPose(BaseTool):
         # x_src = M_inv[0,0]*x_dst + M_inv[0,1]*y_dst + M_inv[0,2]
         # y_src = M_inv[1,0]*x_dst + M_inv[1,1]*y_dst + M_inv[1,2]
         #
-        # In normalized coords:
-        # x_src_norm = 2*x_src/src_w - 1
-        # x_dst = (x_dst_norm + 1) * dst_w / 2
+        # With align_corners=False, normalized coords map to pixel centers:
+        # x_pixel = ((x_norm + 1) * size - 1) / 2
+        # x_norm = (2*x_pixel + 1) / size - 1
         #
         # Substituting and simplifying:
         theta[0, 0] = M_inv[0, 0] * dst_w / src_w
         theta[0, 1] = M_inv[0, 1] * dst_h / src_w
-        theta[0, 2] = (M_inv[0, 0] * dst_w / 2 + M_inv[0, 1] * dst_h / 2 + M_inv[0, 2]) * 2 / src_w - 1
+        theta[0, 2] = (M_inv[0, 0] * (dst_w - 1) + M_inv[0, 1] * (dst_h - 1)
+                       + 2 * M_inv[0, 2] + 1) / src_w - 1
 
         theta[1, 0] = M_inv[1, 0] * dst_w / src_h
         theta[1, 1] = M_inv[1, 1] * dst_h / src_h
-        theta[1, 2] = (M_inv[1, 0] * dst_w / 2 + M_inv[1, 1] * dst_h / 2 + M_inv[1, 2]) * 2 / src_h - 1
+        theta[1, 2] = (M_inv[1, 0] * (dst_w - 1) + M_inv[1, 1] * (dst_h - 1)
+                       + 2 * M_inv[1, 2] + 1) / src_h - 1
 
         return theta

@@ -141,7 +141,8 @@ class BodyWithFeet:
             tuple: A tuple containing:
                 - keypoints (np.ndarray): Estimated keypoint coordinates.
                 - scores (np.ndarray): Confidence scores for each keypoint.
-                - bboxes (np.ndarray): Bounding boxes in [x1, y1, x2, y2] format.
+                - bboxes (np.ndarray): Person detections in
+                  [x1, y1, x2, y2, det_score] format, shape (N, 5).
         """
         bboxes = self.det_model(image)
         keypoints, scores = self.pose_model(image, bboxes=bboxes)
@@ -159,7 +160,7 @@ class BodyWithFeet:
             List of (keypoints, scores, bboxes) tuples, one per image.
             keypoints: shape (num_people, 26, 2) for Halpe26 format
             scores: shape (num_people, 26)
-            bboxes: shape (num_people, 4) in [x1, y1, x2, y2] format
+            bboxes: shape (num_people, 5) in [x1, y1, x2, y2, det_score] format
         """
         # Batch detection for all frames at once
         all_bboxes = self.det_model.predict_batch(images)

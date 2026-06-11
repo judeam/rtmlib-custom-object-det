@@ -111,10 +111,13 @@ class BatchVideoProcessor:
                         # Fallback for solutions without predict_batch
                         batch_results = [self.solution(f) for f in frames]
 
-                    # Store results with frame indices
-                    for idx, frame, (keypoints, scores) in zip(
+                    # Store results with frame indices.
+                    # Solutions may return (keypoints, scores) or
+                    # (keypoints, scores, bboxes) tuples - handle both.
+                    for idx, frame, result in zip(
                         frame_indices, frames, batch_results
                     ):
+                        keypoints, scores = result[0], result[1]
                         if return_frames:
                             results[idx] = (keypoints, scores, frame)
                         else:
@@ -122,7 +125,8 @@ class BatchVideoProcessor:
 
                     # Optional visualization / video writing
                     if output_path:
-                        for frame, (kpts, scores) in zip(frames, batch_results):
+                        for frame, result in zip(frames, batch_results):
+                            kpts, scores = result[0], result[1]
                             vis_frame = draw_skeleton(
                                 frame.copy(), kpts, scores, kpt_thr=kpt_thr
                             )
@@ -177,9 +181,11 @@ class BatchVideoProcessor:
                     batch_results = [self.solution(f) for f in frames]
 
                 # Call callback for each frame
-                for idx, frame, (kpts, scores) in zip(
+                # (results may be 2-tuples or 3-tuples with bboxes)
+                for idx, frame, result in zip(
                     frame_indices, frames, batch_results
                 ):
+                    kpts, scores = result[0], result[1]
                     if not frame_callback(idx, frame, kpts, scores):
                         return
 
@@ -194,10 +200,13 @@ class BatchVideoProcessor:
         """Iterate over video frames with batch inference.
 
         Yields:
-            Tuple of (frame_index, frame, keypoints, scores)
+            Tuple of (frame_index, frame, keypoints, scores, bboxes).
+            bboxes is None for solutions that don't return detection boxes;
+            otherwise an array of person detections (typically (N, 5) in
+            [x1, y1, x2, y2, score] format).
 
         Example:
-            for idx, frame, kpts, scores in processor.iter_video('video.mp4'):
+            for idx, frame, kpts, scores, bboxes in processor.iter_video('video.mp4'):
                 # Process each frame
                 vis = draw_skeleton(frame, kpts, scores)
                 cv2.imshow('frame', vis)
@@ -213,10 +222,12 @@ class BatchVideoProcessor:
                 else:
                     batch_results = [self.solution(f) for f in frames]
 
-                for idx, frame, (kpts, scores) in zip(
+                for idx, frame, result in zip(
                     frame_indices, frames, batch_results
                 ):
-                    yield idx, frame, kpts, scores
+                    kpts, scores = result[0], result[1]
+                    bboxes = result[2] if len(result) > 2 else None
+                    yield idx, frame, kpts, scores, bboxes
 
     def to_dataframe(
         self,

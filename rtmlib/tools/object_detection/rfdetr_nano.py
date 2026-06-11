@@ -21,7 +21,9 @@ class RFDETRNano(BaseTool):
     """
 
     PERSON_CLASS = 5  # Person class in the fine-tuned model (class 5 based on debug output)
-    _EMPTY_BOXES = np.array([], dtype=np.float32).reshape(0, 4)  # Pre-allocated empty result
+    _EMPTY_BOXES = np.array([], dtype=np.float32).reshape(0, 5)  # Pre-allocated empty result
+    _DEDUP_IOU_THR = 0.9  # Drop boxes overlapping a higher-scoring box above this IoU
+    _MIN_BOX_AREA = 4.0  # Minimum box area in px^2 (sanity filter)
 
     def __init__(
         self,
@@ -513,12 +515,61 @@ class RFDETRNano(BaseTool):
             image: Input image as numpy array (BGR format from OpenCV).
 
         Returns:
-            Filtered bounding boxes for person class in format [[x1, y1, x2, y2], ...].
+            Filtered person detections in format [[x1, y1, x2, y2, score], ...].
         """
         if self.backend == 'pytorch' or self._engine is None:
             return self._inference_pytorch(image)
         else:
             return self._inference_tensorrt(image)
+
+    def _dedup_and_filter_detections(self, detections: np.ndarray) -> np.ndarray:
+        """Drop degenerate and near-duplicate detections.
+
+        Applies a minimum-area sanity filter and a conservative IoU-based
+        dedup: any box with IoU > _DEDUP_IOU_THR against a higher-scoring
+        box is dropped (greedy, score-descending).
+
+        Args:
+            detections: Array of shape (N, 5) in [x1, y1, x2, y2, score] format.
+
+        Returns:
+            Filtered detections sorted by score (descending), shape (M, 5).
+        """
+        if len(detections) == 0:
+            return detections
+
+        widths = np.maximum(detections[:, 2] - detections[:, 0], 0.0)
+        heights = np.maximum(detections[:, 3] - detections[:, 1], 0.0)
+        areas = widths * heights
+        detections = detections[areas >= self._MIN_BOX_AREA]
+
+        if len(detections) <= 1:
+            return detections
+
+        # Greedy dedup in score-descending order
+        order = np.argsort(-detections[:, 4], kind='stable')
+        detections = detections[order]
+        x1, y1 = detections[:, 0], detections[:, 1]
+        x2, y2 = detections[:, 2], detections[:, 3]
+        areas = np.maximum(x2 - x1, 0.0) * np.maximum(y2 - y1, 0.0)
+
+        keep = []
+        for i in range(len(detections)):
+            duplicate = False
+            for j in keep:
+                ix1 = max(x1[i], x1[j])
+                iy1 = max(y1[i], y1[j])
+                ix2 = min(x2[i], x2[j])
+                iy2 = min(y2[i], y2[j])
+                inter = max(ix2 - ix1, 0.0) * max(iy2 - iy1, 0.0)
+                union = areas[i] + areas[j] - inter
+                if union > 0 and inter / union > self._DEDUP_IOU_THR:
+                    duplicate = True
+                    break
+            if not duplicate:
+                keep.append(i)
+
+        return detections[keep]
 
     def _inference_pytorch(self, image: np.ndarray) -> np.ndarray:
         """Run inference using PyTorch model."""
@@ -577,6 +628,9 @@ class RFDETRNano(BaseTool):
             self._cuda_graph.replay()
             # No explicit sync - implicit sync happens on .cpu() transfer
         else:
+            # Make the private stream wait for the input copy issued on the
+            # current stream, then sync so outputs are complete before reads.
+            self._stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(self._stream):
                 self._context.execute_async_v3(stream_handle=self._stream.cuda_stream)
             self._stream.synchronize()  # Only sync if not using CUDA graph
@@ -590,7 +644,11 @@ class RFDETRNano(BaseTool):
     def _postprocess_tensorrt(
         self, boxes, scores, orig_w: int, orig_h: int
     ) -> np.ndarray:
-        """Postprocess TensorRT outputs."""
+        """Postprocess TensorRT outputs.
+
+        Returns:
+            Detections in [x1, y1, x2, y2, score] format, shape (N, 5).
+        """
         import torch
 
         # Apply sigmoid to scores
@@ -610,10 +668,11 @@ class RFDETRNano(BaseTool):
         valid_mask = (max_scores >= self.score_thr) & (class_ids == self.PERSON_CLASS)
 
         if not valid_mask.any():
-            return np.array([]).reshape(0, 4)
+            return self._EMPTY_BOXES.copy()
 
         # Get valid boxes and convert from cxcywh to xyxy
         valid_boxes = boxes[valid_mask]
+        valid_scores = max_scores[valid_mask]
         cx, cy, w, h = valid_boxes[:, 0], valid_boxes[:, 1], valid_boxes[:, 2], valid_boxes[:, 3]
 
         # Scale to original image size (coordinates are normalized 0-1)
@@ -622,9 +681,9 @@ class RFDETRNano(BaseTool):
         x2 = (cx + w / 2) * orig_w
         y2 = (cy + h / 2) * orig_h
 
-        # Stack and convert to numpy
-        boxes_xyxy = torch.stack([x1, y1, x2, y2], dim=1)
-        return boxes_xyxy.cpu().numpy()
+        # Stack [x1, y1, x2, y2, score] and convert to numpy
+        detections = torch.stack([x1, y1, x2, y2, valid_scores], dim=1)
+        return self._dedup_and_filter_detections(detections.cpu().numpy())
 
     def _filter_person_detections(self, detections) -> np.ndarray:
         """Filter RF-DETR detections to only include person class.
@@ -633,10 +692,10 @@ class RFDETRNano(BaseTool):
             detections: Detection results from RF-DETR model.
 
         Returns:
-            Filtered bounding boxes for person class in format [[x1, y1, x2, y2], ...].
+            Filtered person detections in format [[x1, y1, x2, y2, score], ...].
         """
         if detections is None:
-            return np.array([]).reshape(0, 4)
+            return self._EMPTY_BOXES.copy()
 
         # Handle RF-DETR detection format
         if hasattr(detections, "xyxy") and len(detections.xyxy) > 0:
@@ -648,20 +707,30 @@ class RFDETRNano(BaseTool):
             person_mask = (class_ids == self.PERSON_CLASS) & (confidences >= self.score_thr)
 
             if not person_mask.any():
-                return np.array([]).reshape(0, 4)
+                return self._EMPTY_BOXES.copy()
 
-            # Extract person boxes
+            # Extract person boxes and scores
             person_boxes = boxes[person_mask]
+            person_scores = confidences[person_mask]
 
             # Convert to numpy if needed
             if hasattr(person_boxes, 'cpu'):
                 person_boxes = person_boxes.cpu().numpy()
             elif not isinstance(person_boxes, np.ndarray):
                 person_boxes = np.array(person_boxes)
+            if hasattr(person_scores, 'cpu'):
+                person_scores = person_scores.cpu().numpy()
+            elif not isinstance(person_scores, np.ndarray):
+                person_scores = np.array(person_scores)
 
-            return person_boxes
+            person_detections = np.concatenate(
+                [person_boxes.astype(np.float32),
+                 person_scores.astype(np.float32).reshape(-1, 1)],
+                axis=1,
+            )
+            return self._dedup_and_filter_detections(person_detections)
 
-        return np.array([]).reshape(0, 4)
+        return self._EMPTY_BOXES.copy()
 
     # ============================================================
     # Batch Processing Methods (for high-throughput inference)
@@ -682,8 +751,8 @@ class RFDETRNano(BaseTool):
             threshold: Optional confidence threshold override.
 
         Returns:
-            List of detection arrays, one per frame. Each array has shape (N, 4)
-            with format [[x1, y1, x2, y2], ...] for person detections.
+            List of detection arrays, one per frame. Each array has shape (N, 5)
+            with format [[x1, y1, x2, y2, score], ...] for person detections.
         """
         if self.backend == 'pytorch' or self._engine is None:
             # Fallback to sequential for non-TensorRT
@@ -842,10 +911,15 @@ class RFDETRNano(BaseTool):
                 self._cuda_graph.replay()
                 # No explicit sync - implicit sync happens on .cpu() transfer
             else:
+                # Make the private stream wait for the input copy issued on
+                # the current stream, then sync so outputs are complete
+                # before postprocessing reads them.
+                self._stream.wait_stream(torch.cuda.current_stream())
                 with torch.cuda.stream(self._stream):
                     self._context.execute_async_v3(
                         stream_handle=self._stream.cuda_stream
                     )
+                self._stream.synchronize()
 
             # Parse outputs using zero-copy views (narrow())
             actual_count = len(chunk_frames)
@@ -885,7 +959,8 @@ class RFDETRNano(BaseTool):
             threshold: Confidence threshold
 
         Returns:
-            List of detection arrays per frame, each with shape (N, 4)
+            List of detection arrays per frame, each with shape (N, 5)
+            in [x1, y1, x2, y2, score] format
         """
         import torch
 
@@ -928,6 +1003,7 @@ class RFDETRNano(BaseTool):
 
         # Single batched CPU transfer - .cpu() implicitly syncs with GPU
         boxes_cpu = boxes_xyxy.cpu().numpy()
+        scores_cpu = max_scores.cpu().numpy()
         valid_cpu = valid_mask.cpu().numpy()
 
         # Create results per frame using pre-computed GPU filter mask
@@ -937,6 +1013,15 @@ class RFDETRNano(BaseTool):
             if len(valid_indices) == 0:
                 results.append(self._EMPTY_BOXES)
             else:
-                results.append(boxes_cpu[batch_idx, valid_indices])
+                frame_detections = np.concatenate(
+                    [
+                        boxes_cpu[batch_idx, valid_indices].astype(np.float32),
+                        scores_cpu[batch_idx, valid_indices]
+                        .astype(np.float32)
+                        .reshape(-1, 1),
+                    ],
+                    axis=1,
+                )
+                results.append(self._dedup_and_filter_detections(frame_detections))
 
         return results
