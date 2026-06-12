@@ -144,22 +144,30 @@ def download_checkpoint(url: str,
         download_url_to_file(url, cached_file, hash_prefix, progress=progress)
 
     if str(cached_file).split('.')[-1] == 'zip':
-        # os.system(f'unzip -d {dst_dir}/tmp {cached_file}')
         tmp_dir = Path(Path(cached_file).parent, "tmp")
         extract_zip(cached_file, tmp_dir)
-        cached_list = glob(f'{dst_dir}/**', recursive=True)
 
-        for each in cached_list:
-            if each[-12:] == 'end2end.onnx':
+        # Search ONLY inside this zip's extraction dir. The checkpoints dir
+        # can legitimately contain other models' end2end.onnx (e.g. a Docker
+        # image pre-download in raw zip layout); globbing the whole dir
+        # picked whichever sorted first and renamed the WRONG network to
+        # this model's name — a 256x192 rtmpose-m was served under the
+        # rtmpose-x 384x288 filename, and the TensorRT engine built from it
+        # failed every inference with a 192-vs-288 shape mismatch.
+        cached_onnx = None
+        for each in sorted(glob(f'{tmp_dir}/**', recursive=True)):
+            if each.endswith('end2end.onnx'):
                 cached_onnx = each
                 break
-        # os.system(f'mv {cached_onnx} {onnx_name}')
-        # os.system(f'rm -rf {cached_file}')
-        # os.system(f'rm -rf {dst_dir}/tmp')
+        if cached_onnx is None:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            raise FileNotFoundError(
+                f'end2end.onnx not found inside {cached_file}')
+
         shutil.move(cached_onnx, onnx_name)
         os.remove(cached_file)
         shutil.rmtree(tmp_dir)
-        
+
         cached_file = onnx_name
 
     return str(cached_file)
