@@ -5,6 +5,7 @@ Supports batch processing with CUDA Graphs for maximum throughput.
 
 from typing import Optional, List, Tuple
 import numpy as np
+import glob
 import os
 import shutil
 from pathlib import Path
@@ -85,48 +86,79 @@ class RFDETRNano(BaseTool):
             # Use PyTorch model directly
             self._load_pytorch_model()
 
-    def _resolve_model_path(self) -> str:
-        """Resolve the default model path, decompressing if needed."""
+    def _candidate_model_paths(self) -> "list[tuple[str, str]]":
+        """(models_dir, model_path) pairs to look for the checkpoint in."""
         current_dir = os.path.dirname(os.path.abspath(__file__))
 
-        # Try in tools/models directory
-        tools_models_path = os.path.join(
-            current_dir, '..', 'models', 'rfdetr_nano_person.pt'
+        tools_models_dir = os.path.abspath(
+            os.path.join(current_dir, '..', 'models')
         )
-        tools_models_path = os.path.abspath(tools_models_path)
-
-        # Try relative to project root (for development)
-        # current_dir is rtmlib/tools/object_detection/, so 3 levels up is project root
+        # current_dir is rtmlib/tools/object_detection/, so 3 levels up is
+        # the project root (for development checkouts).
         project_root = os.path.dirname(
             os.path.dirname(os.path.dirname(current_dir))
         )
-        dev_model_path = os.path.join(project_root, 'models', 'rfdetr_nano_person.pt')
+        dev_models_dir = os.path.join(project_root, 'models')
 
-        # Choose the path that exists
-        if os.path.exists(tools_models_path):
-            return tools_models_path
-        elif os.path.exists(dev_model_path):
-            return dev_model_path
-        else:
-            # Try to decompress from split xz parts
-            tools_models_dir = os.path.join(current_dir, '..', 'models')
-            tools_models_dir = os.path.abspath(tools_models_dir)
-            dev_models_dir = os.path.join(project_root, 'models')
+        return [
+            (tools_models_dir,
+             os.path.join(tools_models_dir, 'rfdetr_nano_person.pt')),
+            (dev_models_dir,
+             os.path.join(dev_models_dir, 'rfdetr_nano_person.pt')),
+        ]
 
-            # Check both possible locations for compressed parts
-            for models_dir, model_path in [
-                (tools_models_dir, tools_models_path),
-                (dev_models_dir, dev_model_path)
-            ]:
-                if self._decompress_model_if_needed(models_dir, model_path):
-                    return model_path
+    def _resolve_model_path(self) -> str:
+        """Where the checkpoint is (or would be), WITHOUT decompressing it.
 
-            # Fallback: create models directory and raise error
-            os.makedirs(tools_models_dir, exist_ok=True)
-            raise FileNotFoundError(
-                f"Model file not found. Please place 'rfdetr_nano_person.pt' "
-                f"or compressed parts 'rfdetr_nano_person.pt.xz.part_*' in: {tools_models_dir}"
-            )
+        Deliberately does no work beyond path arithmetic. The engine filename
+        is derived from this path's stem and parent, so construction needs the
+        name long before -- and usually instead of -- the bytes: on the
+        TensorRT path a cached engine is loaded and the checkpoint is never
+        read at all.
+
+        It used to decompress here, which meant every cold container joined
+        three xz parts and wrote 115MB (9.1s measured on an L4 Cloud Run
+        instance) to produce a file nothing then opened. Decompression now
+        happens in _ensure_model_file, called only where the checkpoint is
+        actually about to be loaded.
+        """
+        candidates = self._candidate_model_paths()
+
+        for _models_dir, model_path in candidates:
+            if os.path.exists(model_path):
+                return model_path
+
+        # Nothing decompressed yet: name the location the compressed parts
+        # would decompress into, so the engine path stays stable either way.
+        for models_dir, model_path in candidates:
+            if glob.glob(os.path.join(
+                    models_dir, 'rfdetr_nano_person.pt.xz.part_*')):
+                return model_path
+
+        tools_models_dir = candidates[0][0]
+        os.makedirs(tools_models_dir, exist_ok=True)
+        raise FileNotFoundError(
+            f"Model file not found. Please place 'rfdetr_nano_person.pt' "
+            f"or compressed parts 'rfdetr_nano_person.pt.xz.part_*' in: {tools_models_dir}"
+        )
+
+    def _ensure_model_file(self) -> str:
+        """Materialise the checkpoint, decompressing the xz parts if needed.
+
+        Call this immediately before reading the checkpoint -- never during
+        construction. See _resolve_model_path for why.
+        """
+        if os.path.exists(self.model_path):
+            return self.model_path
+
+        models_dir = os.path.dirname(self.model_path)
+        if self._decompress_model_if_needed(models_dir, self.model_path):
+            return self.model_path
+
+        raise FileNotFoundError(
+            f"Model file not found and could not be decompressed: "
+            f"{self.model_path}"
+        )
 
     def _decompress_model_if_needed(self, models_dir: str, output_path: str) -> bool:
         """Decompress model from split xz parts if available.
@@ -187,6 +219,10 @@ class RFDETRNano(BaseTool):
         """Load the PyTorch RF-DETR model."""
         try:
             from rfdetr import RFDETRNano as RFDETRNanoModel
+
+            # The one path that genuinely needs the checkpoint bytes, so this
+            # is where the xz parts are joined if that has not happened yet.
+            self._ensure_model_file()
 
             resolution = self.model_input_size[0]  # Assuming square input
             self.model = RFDETRNanoModel(
