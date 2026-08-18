@@ -101,3 +101,14 @@ def test_repeated_frame_is_uploaded_once_but_crops_are_distinct():
     assert packed.shape[0] == 3
     reference, _, _ = pose._preprocess_batch(image, [BOXES[0], BOXES[1]])
     assert torch.equal(packed[:2], reference)
+
+
+def test_single_image_preprocess_also_accepts_a_gpu_tensor():
+    """Both preprocessors share one upload path, so both take CUDA frames."""
+    pose = _pose()
+    image = _image(6)
+
+    from_numpy, _, _ = pose._preprocess_batch(image, BOXES)
+    from_tensor, _, _ = pose._preprocess_batch(torch.from_numpy(image).cuda(), BOXES)
+
+    assert torch.equal(from_numpy, from_tensor)
