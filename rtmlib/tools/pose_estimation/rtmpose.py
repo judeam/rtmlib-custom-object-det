@@ -739,9 +739,8 @@ class RTMPose(BaseTool):
             warp_mat = get_warp_matrix(centers[i], scales[i], 0, output_size=(w, h))
             thetas[i] = self._warp_mat_to_theta(warp_mat, src_w, src_h, w, h)
 
-        # Upload image to GPU once
-        img_tensor = torch.from_numpy(image).cuda(non_blocking=True)
-        img_tensor = img_tensor.permute(2, 0, 1).float()  # (3, H, W)
+        # Upload image to GPU once (a frame already in VRAM is used as-is)
+        img_tensor = self._as_gpu_chw(image)  # (3, H, W)
 
         # Expand to batch dimension for grid_sample
         # Each person gets the same source image
