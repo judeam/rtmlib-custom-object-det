@@ -165,10 +165,15 @@ class BodyWithFeet:
         # Batch detection for all frames at once
         all_bboxes = self.det_model.predict_batch(images)
 
-        # Pose estimation per frame (batches people internally)
-        results = []
-        for img, bboxes in zip(images, all_bboxes):
-            keypoints, scores = self.pose_model(img, bboxes=bboxes)
-            results.append((keypoints, scores, bboxes))
+        # Pose estimation packed across the whole frame batch. The pose engine
+        # is built at a fixed batch size, so a per-frame call pays for that
+        # whole batch to pose the one player a drill frame contains; packing
+        # crops from every frame in this batch fills the same execution
+        # instead of padding it with zeros. Results are unchanged -- see
+        # RTMPose.predict_frames.
+        pose_results = self.pose_model.predict_frames(images, all_bboxes)
 
-        return results
+        return [
+            (keypoints, scores, bboxes)
+            for (keypoints, scores), bboxes in zip(pose_results, all_bboxes)
+        ]
