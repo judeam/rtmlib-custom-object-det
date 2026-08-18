@@ -517,6 +517,201 @@ class RTMPose(BaseTool):
 
         return keypoints, scores
 
+    def predict_frames(self, images: list, bboxes_per_image: list):
+        """Pose-estimate several frames in one pass, filling the engine batch.
+
+        The TensorRT engine is built with min == opt == max batch (see
+        ``_build_engine``), so every execution costs a full ``batch_size``
+        forward pass no matter how many crops are handed to it. Calling this
+        model once per frame therefore pays for ``batch_size`` people to get
+        the one or two who are actually in the frame -- on single-subject
+        footage that is 7/8ths of the pose compute spent on zero padding.
+
+        Crops carry no cross-sample state (SimCC is decoded per sample, and
+        the network's normalisation folds to per-channel affine at inference),
+        so which slot a crop occupies cannot change its result. Packing the
+        batch with crops from *different frames* is therefore output-identical
+        to the per-frame loop, and costs one execution per ``batch_size``
+        crops instead of one per frame.
+
+        Falls back to the per-frame path when TensorRT is not the active
+        backend, so the ONNX Runtime fallback keeps working unchanged.
+
+        Args:
+            images: Frames, all the same resolution (one decode batch).
+            bboxes_per_image: Per-frame list of xyxy(s) boxes, parallel to
+                ``images``.
+
+        Returns:
+            List of ``(keypoints, scores)``, one entry per input frame, in
+            input order. Frames with no boxes yield the empty arrays.
+        """
+        if len(images) != len(bboxes_per_image):
+            raise ValueError(
+                f"images ({len(images)}) and bboxes_per_image "
+                f"({len(bboxes_per_image)}) must be the same length"
+            )
+
+        if self._trt_engine is None:
+            return [self(img, bboxes=bb)
+                    for img, bb in zip(images, bboxes_per_image)]
+
+        # Flatten to (frame index, bbox) pairs. Frames with no detections take
+        # no engine slot at all; they are refilled with empties at the end.
+        frame_ids, flat_bboxes = [], []
+        for frame_id, bboxes in enumerate(bboxes_per_image):
+            for bbox in bboxes:
+                frame_ids.append(frame_id)
+                flat_bboxes.append(bbox)
+
+        results = [
+            (self._EMPTY_KEYPOINTS.copy(), self._EMPTY_SCORES.copy())
+            for _ in images
+        ]
+        if not flat_bboxes:
+            return results
+
+        keypoints, scores = self._infer_flat_crops(
+            images, frame_ids, flat_bboxes
+        )
+
+        # Scatter back: contiguous runs of one frame id, since frame_ids was
+        # built in frame order.
+        for frame_id in range(len(images)):
+            rows = [i for i, f in enumerate(frame_ids) if f == frame_id]
+            if not rows:
+                continue
+            person_kpts = keypoints[rows]
+            person_scores = scores[rows]
+            if self.to_openpose:
+                person_kpts, person_scores = convert_coco_to_openpose(
+                    person_kpts, person_scores
+                )
+            results[frame_id] = (person_kpts, person_scores)
+
+        return results
+
+    def _infer_flat_crops(self, images: list, frame_ids: list, bboxes: list):
+        """Run every (frame, bbox) crop through the engine, batch-packed."""
+        import torch
+
+        batch_tensor, centers, scales = self._preprocess_batch_multi(
+            images, frame_ids, bboxes
+        )
+
+        num_crops = len(bboxes)
+        all_simcc_x, all_simcc_y = [], []
+
+        for chunk_start in range(0, num_crops, self.batch_size):
+            chunk_end = min(chunk_start + self.batch_size, num_crops)
+            chunk_size = chunk_end - chunk_start
+            chunk_tensor = batch_tensor[chunk_start:chunk_end]
+
+            # Only the final chunk can be short now, rather than every frame.
+            if chunk_size < self.batch_size:
+                pad_size = self.batch_size - chunk_size
+                padding = torch.zeros(
+                    (pad_size,) + chunk_tensor.shape[1:],
+                    dtype=chunk_tensor.dtype,
+                    device=chunk_tensor.device,
+                )
+                chunk_tensor = torch.cat([chunk_tensor, padding], dim=0)
+
+            self._trt_input_tensors[self._trt_input_name].copy_(chunk_tensor)
+
+            if self._cuda_graph is not None and self._graph_captured:
+                self._cuda_graph.replay()
+            else:
+                self._trt_stream.wait_stream(torch.cuda.current_stream())
+                self._trt_context.execute_async_v3(
+                    stream_handle=self._trt_stream.cuda_stream
+                )
+                self._trt_stream.synchronize()
+
+            output_names = list(self._trt_output_tensors.keys())
+            all_simcc_x.append(
+                self._trt_output_tensors[output_names[0]][:chunk_size]
+                .cpu().numpy()
+            )
+            all_simcc_y.append(
+                self._trt_output_tensors[output_names[1]][:chunk_size]
+                .cpu().numpy()
+            )
+
+        simcc_x = np.concatenate(all_simcc_x, axis=0)
+        simcc_y = np.concatenate(all_simcc_y, axis=0)
+
+        return self._postprocess_batch(simcc_x, simcc_y, centers, scales)
+
+    def _preprocess_batch_multi(self, images: list, frame_ids: list,
+                                bboxes: list):
+        """``_preprocess_batch`` over crops drawn from more than one frame.
+
+        Identical arithmetic to the single-image version -- same warp matrix,
+        same bilinear ``grid_sample``, same normalisation -- differing only in
+        that each crop samples the frame it came from instead of one shared
+        image. Every frame in a decode batch has the same resolution, so the
+        source images stack into one tensor.
+        """
+        import torch
+        import torch.nn.functional as F
+
+        num_crops = len(bboxes)
+        w, h = self.model_input_size
+        aspect_ratio = w / h
+        src_h, src_w = images[0].shape[:2]
+
+        bboxes_arr = np.array(bboxes, dtype=np.float32)
+        centers, scales = self._compute_centers_scales_batch(
+            bboxes_arr, aspect_ratio
+        )
+
+        thetas = np.zeros((num_crops, 2, 3), dtype=np.float32)
+        for i in range(num_crops):
+            warp_mat = get_warp_matrix(
+                centers[i], scales[i], 0, output_size=(w, h)
+            )
+            thetas[i] = self._warp_mat_to_theta(warp_mat, src_w, src_h, w, h)
+
+        # Upload each distinct frame once, then index it per crop, so a frame
+        # holding several people is still only transferred a single time.
+        used_ids = sorted(set(frame_ids))
+        uploaded = torch.stack([
+            self._as_gpu_chw(images[frame_id]) for frame_id in used_ids
+        ])
+        row_of = {frame_id: row for row, frame_id in enumerate(used_ids)}
+        select = torch.as_tensor(
+            [row_of[frame_id] for frame_id in frame_ids],
+            device=uploaded.device, dtype=torch.long,
+        )
+        img_batch = uploaded.index_select(0, select)
+
+        theta_tensor = torch.from_numpy(thetas).cuda()
+        grid = F.affine_grid(
+            theta_tensor, (num_crops, 3, h, w), align_corners=False
+        )
+        warped = F.grid_sample(
+            img_batch, grid, mode='bilinear', align_corners=False
+        )
+        warped = warped.sub_(self._gpu_norm_mean).div_(self._gpu_norm_std)
+
+        return warped, centers, scales
+
+    def _as_gpu_chw(self, image):
+        """A single frame as a float CHW CUDA tensor, uploading only if needed.
+
+        Accepts a torch tensor already on the GPU -- which is what an NVDEC
+        decode loop has in hand -- so the caller does not have to round-trip
+        the frame through host memory just to hand it back.
+        """
+        import torch
+
+        if isinstance(image, torch.Tensor):
+            tensor = image if image.is_cuda else image.cuda(non_blocking=True)
+        else:
+            tensor = torch.from_numpy(image).cuda(non_blocking=True)
+        return tensor.permute(2, 0, 1).float()
+
     def _preprocess_batch(self, image: np.ndarray, bboxes: list):
         """Batch GPU preprocessing - all crops in one pass.
 

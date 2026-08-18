@@ -727,8 +727,14 @@ class RFDETRNano(BaseTool):
 
         gpu_buffer = self._preprocess_buffers[buffer_key]
 
-        # Fast path: copy frames directly to GPU (avoids numpy.stack bottleneck)
+        # Fast path: copy frames directly to GPU (avoids numpy.stack bottleneck).
+        # A frame that is already a CUDA tensor -- which is what an NVDEC
+        # decode loop holds -- is copied device to device, so the caller does
+        # not have to stage it through host memory to hand it back.
         for i, frame in enumerate(frames):
+            if isinstance(frame, torch.Tensor):
+                gpu_buffer[i].copy_(frame, non_blocking=True)
+                continue
             # Check contiguous to avoid unnecessary copy
             if not frame.flags['C_CONTIGUOUS']:
                 frame = np.ascontiguousarray(frame)
