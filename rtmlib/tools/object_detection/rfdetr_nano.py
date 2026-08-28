@@ -311,18 +311,44 @@ class RFDETRNano(BaseTool):
                 batch_size=self.batch_size,
             )
 
-            # RF-DETR exports to 'output/inference_model.onnx' or similar
-            # regardless of output_dir parameter - need to find and rename
+            # RF-DETR writes the ONNX under a name of its own choosing and
+            # ignores our filename, so we have to go and find it. The name is
+            # NOT stable across rfdetr versions: it used to be
+            # inference_model.onnx and is now rfdetr-nano.onnx. Matching on a
+            # fixed list of names is what silently broke this path — every
+            # candidate missed, _export_to_onnx returned None, the engine was
+            # never built, and RFDETRNano fell back to PyTorch on every single
+            # video while looking like it was merely "not available".
+            #
+            # So: try the known names first, then fall back to whatever .onnx
+            # this export actually dropped in the output dir, newest first.
             if not os.path.exists(onnx_path):
-                # Check common RF-DETR export locations
+                known_names = ("rfdetr-nano.onnx", "inference_model.onnx")
+                search_dirs = (
+                    str(output_dir),
+                    os.path.join(cwd, "output"),
+                    cwd,
+                )
                 possible_paths = [
-                    os.path.join(str(output_dir), "inference_model.onnx"),
-                    os.path.join(cwd, "output", "inference_model.onnx"),
-                    os.path.join(cwd, "inference_model.onnx"),
-                    "output/inference_model.onnx",
-                    "inference_model.onnx",
+                    os.path.join(directory, name)
+                    for directory in search_dirs
+                    for name in known_names
                 ]
+                # Anything else this version decided to call it.
+                for directory in search_dirs:
+                    if os.path.isdir(directory):
+                        possible_paths.extend(
+                            sorted(
+                                glob.glob(os.path.join(directory, "*.onnx")),
+                                key=os.path.getmtime,
+                                reverse=True,
+                            )
+                        )
+
                 for possible_path in possible_paths:
+                    # Never consume an unrelated cached export as if it were ours.
+                    if os.path.abspath(possible_path) == os.path.abspath(onnx_path):
+                        continue
                     if os.path.exists(possible_path):
                         print(f"Found exported ONNX at: {possible_path}, moving to: {onnx_path}")
                         shutil.move(possible_path, onnx_path)
