@@ -225,9 +225,18 @@ class RFDETRNano(BaseTool):
             self._ensure_model_file()
 
             resolution = self.model_input_size[0]  # Assuming square input
+            # trust_checkpoint=True is required from rfdetr's hardened loader
+            # onwards: _safe_torch_load defaults to weights_only=True and raises
+            # on a checkpoint carrying custom Python objects, which
+            # rfdetr_nano_person.pt does. Without it the whole pose stage dies at
+            # construction. Trusting it is correct here and nowhere else — the
+            # checkpoint is not user input, it ships in this repository as the
+            # rfdetr_nano_person.pt.xz.part_* files that _ensure_model_file()
+            # joins immediately above.
             self.model = RFDETRNanoModel(
                 pretrain_weights=self.model_path,
-                resolution=resolution
+                resolution=resolution,
+                trust_checkpoint=True,
             )
             print(f"Loaded RF-DETR Nano model from {self.model_path}")
         except ImportError:
