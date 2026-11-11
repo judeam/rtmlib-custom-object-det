@@ -855,41 +855,41 @@ class RFDETRNano(BaseTool):
         batch_size = len(frames)
         frame_h, frame_w = frames[0].shape[:2]
 
-        # Use pre-allocated GPU buffer (avoid allocation per batch)
+        # One fp32 staging buffer, filled straight from the frames: the uint8
+        # copy of every frame that used to sit in between (and the fp32 copy
+        # made from it) is gone. Laid out NCHW, like the tensor the channel
+        # swap used to hand to the resize, so the resize runs the same kernel.
         buffer_key = (batch_size, frame_h, frame_w)
         if buffer_key not in self._preprocess_buffers:
             self._preprocess_buffers[buffer_key] = torch.empty(
-                (batch_size, frame_h, frame_w, 3),
-                dtype=torch.uint8,
+                (batch_size, 3, frame_h, frame_w),
+                dtype=torch.float32,
                 device='cuda'
             )
             print(f"[RFDETRNano] Allocated preprocess buffer: {buffer_key}")
 
         gpu_buffer = self._preprocess_buffers[buffer_key]
 
-        # Fast path: copy frames directly to GPU (avoids numpy.stack bottleneck).
         # A frame that is already a CUDA tensor -- which is what an NVDEC
-        # decode loop holds -- is copied device to device, so the caller does
+        # decode loop holds -- is converted device to device, so the caller does
         # not have to stage it through host memory to hand it back.
         for i, frame in enumerate(frames):
             if isinstance(frame, torch.Tensor):
-                gpu_buffer[i].copy_(frame, non_blocking=True)
+                gpu_buffer[i].copy_(frame.permute(2, 0, 1), non_blocking=True)
                 continue
             # Check contiguous to avoid unnecessary copy
             if not frame.flags['C_CONTIGUOUS']:
                 frame = np.ascontiguousarray(frame)
             gpu_buffer[i].copy_(
-                torch.from_numpy(frame),
+                torch.from_numpy(frame).permute(2, 0, 1),
                 non_blocking=True
             )
 
-        # Convert to float and reorder dimensions on GPU: (B, H, W, C) -> (B, C, H, W)
-        batch_tensor = gpu_buffer[:batch_size].permute(0, 3, 1, 2).float()
+        batch_tensor = gpu_buffer
 
-        # BGR→RGB channel swap on GPU (faster than CPU cv2.cvtColor)
-        batch_tensor = batch_tensor[:, [2, 1, 0], :, :]
-
-        # Resize on GPU if needed
+        # Resize on GPU if needed. Interpolation treats channels independently,
+        # so it runs on the BGR planes and the channel swap below touches the
+        # small 384x384 result instead of the full-resolution frames.
         if frame_h != resolution or frame_w != resolution:
             batch_tensor = F.interpolate(
                 batch_tensor,
@@ -897,6 +897,9 @@ class RFDETRNano(BaseTool):
                 mode="bilinear",
                 align_corners=False,
             )
+
+        # BGR->RGB channel swap on GPU
+        batch_tensor = batch_tensor[:, [2, 1, 0], :, :]
 
         # Fused normalize on GPU: [0-255] -> [0-1] -> ImageNet normalized
         batch_tensor = batch_tensor.mul_(1.0 / 255.0)
@@ -965,7 +968,7 @@ class RFDETRNano(BaseTool):
         actual_batch = len(frames)
         engine_batch = self.batch_size
 
-        all_results = []
+        packed = []
 
         # Process in chunks matching engine batch size
         for chunk_start in range(0, actual_batch, engine_batch):
@@ -998,7 +1001,9 @@ class RFDETRNano(BaseTool):
                     )
                 self._stream.synchronize()
 
-            # Parse outputs using zero-copy views (narrow())
+            # Parse outputs using zero-copy views (narrow()) and reduce them
+            # on the GPU right away: the next chunk's execution overwrites the
+            # engine's output buffers. Nothing is sent to the host yet.
             actual_count = len(chunk_frames)
             boxes = self._output_tensors[self._boxes_name].narrow(0, 0, actual_count)
             scores = (
@@ -1006,14 +1011,13 @@ class RFDETRNano(BaseTool):
                 if self._scores_name
                 else None
             )
-
-            # Postprocess on GPU, then transfer
-            chunk_results = self._postprocess_tensorrt_batch(
-                boxes, scores, chunk_sizes, threshold
+            packed.append(
+                self._reduce_detections_gpu(boxes, scores, chunk_sizes, threshold)
             )
-            all_results.extend(chunk_results)
 
-        return all_results
+        # One transfer, one sync, for the whole frame batch.
+        host = (packed[0] if len(packed) == 1 else torch.cat(packed, dim=0)).cpu().numpy()
+        return self._detections_from_host(host)
 
     def _postprocess_tensorrt_batch(
         self,
@@ -1041,7 +1045,44 @@ class RFDETRNano(BaseTool):
         """
         import torch
 
-        num_frames = len(frame_sizes)
+        host = self._reduce_detections_gpu(
+            boxes, scores, frame_sizes, threshold
+        ).cpu().numpy()
+        return self._detections_from_host(host)
+
+    def _frame_sizes_tensor(self, frame_sizes: List[Tuple[int, int]]) -> "torch.Tensor":
+        """Frame sizes as a CUDA tensor, uploaded once per distinct size list.
+
+        Building it per chunk is a pageable host-to-device copy, which waits
+        for everything queued on the stream before it.
+        """
+        import torch
+
+        cache = self.__dict__.setdefault("_frame_size_cache", {})
+        key = tuple(frame_sizes)
+        tensor = cache.get(key)
+        if tensor is None:
+            if len(cache) >= 8:
+                cache.clear()
+            tensor = torch.as_tensor(frame_sizes, device="cuda", dtype=torch.float32)
+            cache[key] = tensor
+        return tensor
+
+    def _reduce_detections_gpu(
+        self,
+        boxes: "torch.Tensor",
+        scores: "torch.Tensor",
+        frame_sizes: List[Tuple[int, int]],
+        threshold: float,
+    ) -> "torch.Tensor":
+        """Per-query boxes, score and validity as one (frames, queries, 6) tensor.
+
+        Columns 0-3 are xyxy in pixels, 4 the best class score, 5 is 1.0 where
+        the query is a person above ``threshold``. Everything is float32 and
+        exact (a 0/1 flag), so packing changes no value; it lets the whole
+        batch come back in a single device-to-host copy.
+        """
+        import torch
 
         # Apply sigmoid to all scores at once (GPU)
         if scores is not None:
@@ -1053,11 +1094,9 @@ class RFDETRNano(BaseTool):
                 boxes.shape[0], boxes.shape[1], device="cuda", dtype=torch.int64
             )
 
-        # Filter on GPU before CPU transfer - only transfer valid detections
         valid_mask = (max_scores >= threshold) & (class_ids == self.PERSON_CLASS)
 
-        # Create frame sizes tensor for vectorized scaling
-        frame_sizes_t = torch.as_tensor(frame_sizes, device="cuda", dtype=torch.float32)
+        frame_sizes_t = self._frame_sizes_tensor(frame_sizes)
         orig_w = frame_sizes_t[:, 0:1]  # (num_frames, 1)
         orig_h = frame_sizes_t[:, 1:2]  # (num_frames, 1)
 
@@ -1067,25 +1106,26 @@ class RFDETRNano(BaseTool):
         cx = boxes[:, :, 0]
         cy = boxes[:, :, 1]
 
-        # Scale and stack - vectorized for all frames
-        boxes_xyxy = torch.stack(
+        return torch.stack(
             [
                 (cx - half_w) * orig_w,
                 (cy - half_h) * orig_h,
                 (cx + half_w) * orig_w,
                 (cy + half_h) * orig_h,
+                max_scores,
+                valid_mask.to(torch.float32),
             ],
             dim=2,
-        )  # (num_frames, 300, 4)
+        )
 
-        # Single batched CPU transfer - .cpu() implicitly syncs with GPU
-        boxes_cpu = boxes_xyxy.cpu().numpy()
-        scores_cpu = max_scores.cpu().numpy()
-        valid_cpu = valid_mask.cpu().numpy()
+    def _detections_from_host(self, host: np.ndarray) -> List[np.ndarray]:
+        """Per-frame (N, 5) detections from the packed host array."""
+        boxes_cpu = host[:, :, :4]
+        scores_cpu = host[:, :, 4]
+        valid_cpu = host[:, :, 5] > 0.5
 
-        # Create results per frame using pre-computed GPU filter mask
         results = []
-        for batch_idx in range(num_frames):
+        for batch_idx in range(host.shape[0]):
             valid_indices = np.nonzero(valid_cpu[batch_idx])[0]
             if len(valid_indices) == 0:
                 results.append(self._EMPTY_BOXES)
