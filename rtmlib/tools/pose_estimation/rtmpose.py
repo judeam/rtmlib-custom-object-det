@@ -11,6 +11,27 @@ from .post_processings import convert_coco_to_openpose, get_simcc_maximum
 from .pre_processings import bbox_xyxy2cs, top_down_affine, get_warp_matrix
 
 
+class PendingPose:
+    """Pose results whose engine runs and read-backs are queued, not finished."""
+
+    def __init__(self, model, results, frame_ids=None, launched=None,
+                 num_frames=0):
+        self._model = model
+        self._results = results
+        self._frame_ids = frame_ids
+        self._launched = launched
+        self._num_frames = num_frames
+
+    def result(self):
+        if self._launched is not None:
+            model = self._model
+            keypoints, scores = model._finish_flat_crops(self._launched)
+            model._scatter_results(self._results, self._frame_ids,
+                                   keypoints, scores, self._num_frames)
+            self._launched = self._model = self._frame_ids = None
+        return self._results
+
+
 class RTMPose(BaseTool):
     """RTMPose model with native TensorRT support for fast inference.
 
@@ -556,6 +577,18 @@ class RTMPose(BaseTool):
             List of ``(keypoints, scores)``, one entry per input frame, in
             input order. Frames with no boxes yield the empty arrays.
         """
+        return self.predict_frames_launch(images, bboxes_per_image).result()
+
+    def predict_frames_launch(self, images: list, bboxes_per_image: list):
+        """Queue ``predict_frames`` on the current stream without waiting.
+
+        Crop preprocessing, the engine runs and the read-back of the SimCC
+        outputs (asynchronous, into pinned memory) are queued behind whatever
+        the stream already holds. ``.result()`` on the returned object waits
+        for them and decodes the keypoints, giving exactly what
+        ``predict_frames`` returns. The frames are only read by work queued
+        here, so they may be released once that work has run.
+        """
         if len(images) != len(bboxes_per_image):
             raise ValueError(
                 f"images ({len(images)}) and bboxes_per_image "
@@ -563,8 +596,10 @@ class RTMPose(BaseTool):
             )
 
         if self._trt_engine is None:
-            return [self(img, bboxes=bb)
-                    for img, bb in zip(images, bboxes_per_image)]
+            return PendingPose(self, results=[
+                self(img, bboxes=bb)
+                for img, bb in zip(images, bboxes_per_image)
+            ])
 
         # Flatten to (frame index, bbox) pairs. Frames with no detections take
         # no engine slot at all; they are refilled with empties at the end.
@@ -579,15 +614,15 @@ class RTMPose(BaseTool):
             for _ in images
         ]
         if not flat_bboxes:
-            return results
+            return PendingPose(self, results=results)
 
-        keypoints, scores = self._infer_flat_crops(
-            images, frame_ids, flat_bboxes
-        )
+        launched = self._launch_flat_crops(images, frame_ids, flat_bboxes)
+        return PendingPose(self, results=results, frame_ids=frame_ids,
+                           launched=launched, num_frames=len(images))
 
-        # Scatter back: contiguous runs of one frame id, since frame_ids was
-        # built in frame order.
-        for frame_id in range(len(images)):
+    def _scatter_results(self, results, frame_ids, keypoints, scores, num_frames):
+        """Scatter crop results back to their frames, in frame order."""
+        for frame_id in range(num_frames):
             rows = [i for i, f in enumerate(frame_ids) if f == frame_id]
             if not rows:
                 continue
@@ -598,11 +633,21 @@ class RTMPose(BaseTool):
                     person_kpts, person_scores
                 )
             results[frame_id] = (person_kpts, person_scores)
-
         return results
 
     def _infer_flat_crops(self, images: list, frame_ids: list, bboxes: list):
         """Run every (frame, bbox) crop through the engine, batch-packed."""
+        return self._finish_flat_crops(
+            self._launch_flat_crops(images, frame_ids, bboxes)
+        )
+
+    def _launch_flat_crops(self, images: list, frame_ids: list, bboxes: list):
+        """Queue every (frame, bbox) crop through the engine, batch-packed.
+
+        Returns what ``_finish_flat_crops`` needs: the pinned host staging
+        for the SimCC outputs, an event recorded behind the last copy, and
+        the crop geometry.
+        """
         import torch
 
         batch_tensor, centers, scales = self._preprocess_batch_multi(
@@ -614,8 +659,8 @@ class RTMPose(BaseTool):
         out_x = self._trt_output_tensors[output_names[0]]
         out_y = self._trt_output_tensors[output_names[1]]
         # Host staging for the whole call, filled with asynchronous copies as
-        # each chunk finishes; the stream is synchronised once at the end
-        # instead of after every chunk's two read-backs.
+        # each chunk finishes; the host waits on one event at the end instead
+        # of after every chunk's two read-backs.
         simcc_x = torch.empty(
             (num_crops,) + tuple(out_x.shape[1:]), dtype=out_x.dtype, pin_memory=True
         )
@@ -652,11 +697,17 @@ class RTMPose(BaseTool):
             simcc_x[chunk_start:chunk_end].copy_(out_x[:chunk_size], non_blocking=True)
             simcc_y[chunk_start:chunk_end].copy_(out_y[:chunk_size], non_blocking=True)
 
-        torch.cuda.current_stream().synchronize()
-        simcc_x = simcc_x.numpy()
-        simcc_y = simcc_y.numpy()
+        event = torch.cuda.Event()
+        event.record()
+        return simcc_x, simcc_y, event, centers, scales
 
-        return self._postprocess_batch(simcc_x, simcc_y, centers, scales)
+    def _finish_flat_crops(self, launched):
+        """Wait for a launched crop batch and decode its keypoints."""
+        simcc_x, simcc_y, event, centers, scales = launched
+        event.synchronize()
+        return self._postprocess_batch(
+            simcc_x.numpy(), simcc_y.numpy(), centers, scales
+        )
 
     def _preprocess_batch_multi(self, images: list, frame_ids: list,
                                 bboxes: list):

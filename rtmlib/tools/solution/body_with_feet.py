@@ -177,3 +177,32 @@ class BodyWithFeet:
             (keypoints, scores, bboxes)
             for (keypoints, scores), bboxes in zip(pose_results, all_bboxes)
         ]
+
+    def detect_launch(self, images: List[np.ndarray]):
+        """First half of ``predict_batch``: queue person detection, do not wait.
+
+        Returns a handle for ``detect_result``. See
+        ``RFDETRNano.predict_batch_launch``.
+        """
+        return self.det_model.predict_batch_launch(images)
+
+    @staticmethod
+    def detect_result(handle) -> List[np.ndarray]:
+        """Wait for a ``detect_launch`` and return the per-frame boxes."""
+        return handle.result()
+
+    def pose_launch(self, images: List[np.ndarray], all_bboxes: List[np.ndarray]):
+        """Second half of ``predict_batch``: queue pose estimation, do not wait.
+
+        ``images`` and ``all_bboxes`` are the batch and its detections. Returns
+        a handle for ``pose_result``.
+        """
+        return self.pose_model.predict_frames_launch(images, all_bboxes)
+
+    @staticmethod
+    def pose_result(handle, all_bboxes: List[np.ndarray]):
+        """Wait for a ``pose_launch`` and return what ``predict_batch`` does."""
+        return [
+            (keypoints, scores, bboxes)
+            for (keypoints, scores), bboxes in zip(handle.result(), all_bboxes)
+        ]

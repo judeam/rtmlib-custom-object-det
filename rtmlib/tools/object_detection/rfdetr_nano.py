@@ -13,6 +13,27 @@ from pathlib import Path
 from ..base import BaseTool
 
 
+class PendingDetections:
+    """Detections whose device-to-host copy is queued but may not have run."""
+
+    def __init__(self, detector, host=None, event=None, results=None):
+        self._detector = detector
+        self._host = host
+        self._event = event
+        self._results = results
+
+    @classmethod
+    def ready(cls, results):
+        return cls(None, results=results)
+
+    def result(self) -> List[np.ndarray]:
+        if self._results is None:
+            self._event.synchronize()
+            self._results = self._detector._detections_from_host(self._host.numpy())
+            self._host = self._event = self._detector = None
+        return self._results
+
+
 class RFDETRNano(BaseTool):
     """RFDETRNano object detector with person filtering and TensorRT engine support.
 
@@ -473,6 +494,9 @@ class RFDETRNano(BaseTool):
 
             # Pre-compute normalization constants (avoid allocation each inference)
             self._norm_mean = torch.tensor([0.485, 0.456, 0.406], device="cuda").view(1, 3, 1, 1)
+            # BGR -> RGB channel order, resident on the device (see
+            # _preprocess_batch_for_tensorrt).
+            self._bgr_to_rgb = torch.tensor([2, 1, 0], device="cuda")
             self._norm_std = torch.tensor([0.229, 0.224, 0.225], device="cuda").view(1, 3, 1, 1)
 
             # Set up CUDA graph for faster kernel replay
@@ -899,7 +923,11 @@ class RFDETRNano(BaseTool):
             )
 
         # BGR->RGB channel swap on GPU
-        batch_tensor = batch_tensor[:, [2, 1, 0], :, :]
+        # Indexing with a Python list uploads the list from pageable host
+        # memory on every call, and that upload waits for all work already
+        # queued on the stream: here, the previous chunk's engine run. The
+        # index tensor lives on the device instead. Same gather, same values.
+        batch_tensor = batch_tensor.index_select(1, self._bgr_to_rgb)
 
         # Fused normalize on GPU: [0-255] -> [0-1] -> ImageNet normalized
         batch_tensor = batch_tensor.mul_(1.0 / 255.0)
@@ -942,7 +970,32 @@ class RFDETRNano(BaseTool):
         frames: List[np.ndarray],
         threshold: Optional[float] = None,
     ) -> List[np.ndarray]:
-        """Run batch inference using TensorRT engine with CUDA Graphs.
+        """Run batch inference and wait for the detections."""
+        return self._launch_tensorrt_batch(frames, threshold).result()
+
+    def predict_batch_launch(
+        self,
+        frames: List[np.ndarray],
+        threshold: Optional[float] = None,
+    ) -> "PendingDetections":
+        """Queue batch detection on the current stream without waiting for it.
+
+        ``.result()`` on the returned object waits for the batch and gives
+        what ``predict_batch`` returns. Between the two the host is free to
+        queue more GPU work. The frames must stay alive until the queued work
+        has read them (keep them referenced, or order the stream that frees
+        them behind the current one).
+        """
+        if self.backend == 'pytorch' or self._engine is None:
+            return PendingDetections.ready(self.predict_batch(frames, threshold))
+        return self._launch_tensorrt_batch(frames, threshold)
+
+    def _launch_tensorrt_batch(
+        self,
+        frames: List[np.ndarray],
+        threshold: Optional[float] = None,
+    ) -> "PendingDetections":
+        """Queue batch inference using TensorRT engine with CUDA Graphs.
 
         Key optimizations:
         - CUDA Graph replay (no explicit sync needed)
@@ -1015,9 +1068,15 @@ class RFDETRNano(BaseTool):
                 self._reduce_detections_gpu(boxes, scores, chunk_sizes, threshold)
             )
 
-        # One transfer, one sync, for the whole frame batch.
-        host = (packed[0] if len(packed) == 1 else torch.cat(packed, dim=0)).cpu().numpy()
-        return self._detections_from_host(host)
+        # One transfer for the whole frame batch, into pinned memory behind
+        # the batch's kernels; the host waits on an event (which does not hold
+        # the interpreter lock) when it needs the boxes.
+        dev = packed[0] if len(packed) == 1 else torch.cat(packed, dim=0)
+        host = torch.empty(dev.shape, dtype=dev.dtype, pin_memory=True)
+        host.copy_(dev, non_blocking=True)
+        event = torch.cuda.Event()
+        event.record()
+        return PendingDetections(self, host, event)
 
     def _postprocess_tensorrt_batch(
         self,
