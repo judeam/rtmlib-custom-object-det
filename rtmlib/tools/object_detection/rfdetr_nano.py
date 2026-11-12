@@ -46,6 +46,10 @@ class RFDETRNano(BaseTool):
     _EMPTY_BOXES = np.array([], dtype=np.float32).reshape(0, 5)  # Pre-allocated empty result
     _DEDUP_IOU_THR = 0.9  # Drop boxes overlapping a higher-scoring box above this IoU
     _MIN_BOX_AREA = 4.0  # Minimum box area in px^2 (sanity filter)
+    # Precisions the TensorRT engine can be built at. bf16 is the default and
+    # what the deployed engines are; RFDETR_NANO_TRT_PRECISION picks another.
+    _TRT_PRECISIONS = ("bf16", "fp16", "fp32")
+    trt_precision = "bf16"
 
     def __init__(
         self,
@@ -57,6 +61,7 @@ class RFDETRNano(BaseTool):
         export_format: str = 'engine',
         batch_size: int = 1,
         use_cuda_graphs: bool = True,
+        trt_precision: Optional[str] = None,
     ):
         """Initialize RFDETRNano detector.
 
@@ -69,6 +74,9 @@ class RFDETRNano(BaseTool):
             export_format: Format for export ('engine' for TensorRT, 'onnx' for ONNX).
             batch_size: Batch size for TensorRT inference (default: 1).
             use_cuda_graphs: Whether to use CUDA Graphs for faster inference (default: True).
+            trt_precision: 'bf16', 'fp16' or 'fp32' for the TensorRT engine. None reads
+                RFDETR_NANO_TRT_PRECISION and falls back to 'bf16'. Each precision has
+                its own engine file. The boxes differ slightly between them.
         """
         self.model_input_size = model_input_size
         self.score_thr = score_thr
@@ -77,6 +85,7 @@ class RFDETRNano(BaseTool):
         self.export_format = export_format
         self.batch_size = batch_size
         self.use_cuda_graphs = use_cuda_graphs
+        self.trt_precision = self._resolve_trt_precision(trt_precision)
         self.model = None
         self.engine_path = None
         self._engine = None
@@ -265,17 +274,31 @@ class RFDETRNano(BaseTool):
                 "rfdetr package not installed. Please install with: pip install rfdetr"
             )
 
-    def _get_or_build_engine(self) -> Optional[str]:
-        """Get existing TensorRT engine or build a new one."""
-        # Generate engine path based on model and config
+    @classmethod
+    def _resolve_trt_precision(cls, requested: Optional[str]) -> str:
+        """The engine precision: the argument, else RFDETR_NANO_TRT_PRECISION, else bf16."""
+        value = requested or os.environ.get("RFDETR_NANO_TRT_PRECISION") or "bf16"
+        value = value.strip().lower()
+        if value not in cls._TRT_PRECISIONS:
+            raise ValueError(
+                f"TensorRT precision {value!r} is not one of {', '.join(cls._TRT_PRECISIONS)}"
+            )
+        return value
+
+    def _engine_name(self) -> str:
+        """Engine file name: model, input size, batch size and precision.
+
+        The precision is part of the name, so engines built at different
+        precisions sit side by side and one is never loaded for another.
+        """
         model_stem = Path(self.model_path).stem
         size_str = f"{self.model_input_size[0]}x{self.model_input_size[1]}"
-        # Use BF16 for better dynamic range than FP16
-        precision_str = "bf16" if self.device == 'cuda' else "fp32"
+        precision_str = self.trt_precision if self.device == 'cuda' else "fp32"
+        return f"{model_stem}_{size_str}_b{self.batch_size}_cuda_{precision_str}.engine"
 
-        # Include batch size in engine filename for caching different configurations
-        engine_name = f"{model_stem}_{size_str}_b{self.batch_size}_cuda_{precision_str}.engine"
-        engine_path = str(Path(self.model_path).parent / engine_name)
+    def _get_or_build_engine(self) -> Optional[str]:
+        """Get existing TensorRT engine or build a new one."""
+        engine_path = str(Path(self.model_path).parent / self._engine_name())
 
         print(f"[RFDETRNano] Checking for engine at: {engine_path}")
         print(f"[RFDETRNano] Engine exists: {os.path.exists(engine_path)}")
@@ -304,18 +327,19 @@ class RFDETRNano(BaseTool):
         git+https://github.com/jude-mingay-bps/rf-detr-tensorrt-batch.git
         """
         try:
-            # Load PyTorch model if not already loaded
-            if self.model is None:
-                self._load_pytorch_model()
-
             model_stem = Path(self.model_path).stem
             # Include batch size in ONNX filename for caching different configurations
             onnx_path = str(Path(self.model_path).parent / f"{model_stem}_b{self.batch_size}.onnx")
 
-            # Check if ONNX already exists
+            # An ONNX that is already there is used as it is: the checkpoint is
+            # not loaded to rebuild an engine (another precision, a new GPU).
             if os.path.exists(onnx_path):
                 print(f"ONNX model already exists: {onnx_path}")
                 return onnx_path
+
+            # Load PyTorch model if not already loaded
+            if self.model is None:
+                self._load_pytorch_model()
 
             print(f"Exporting to ONNX with batch_size={self.batch_size}: {onnx_path}")
 
@@ -394,7 +418,7 @@ class RFDETRNano(BaseTool):
             return None
 
     def _build_tensorrt_engine(self, onnx_path: str, engine_path: str) -> Optional[str]:
-        """Build TensorRT engine from ONNX model with BF16 precision."""
+        """Build TensorRT engine from ONNX model at ``self.trt_precision``."""
         try:
             import tensorrt as trt
 
@@ -418,15 +442,19 @@ class RFDETRNano(BaseTool):
             config = builder.create_builder_config()
             config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 4 * (1 << 30))  # 4GB
 
-            # Enable BF16 for CUDA (better dynamic range than FP16)
-            # Fall back to FP16 if BF16 not available
-            if self.device == 'cuda':
-                if hasattr(trt.BuilderFlag, 'BF16') and builder.platform_has_fast_fp16:
+            # Reduced precision on CUDA: bf16 unless another was asked for,
+            # fp16 where this TensorRT has no bf16. fp32 sets no flag.
+            if self.device == 'cuda' and self.trt_precision != "fp32" \
+                    and builder.platform_has_fast_fp16:
+                if self.trt_precision == "bf16" and hasattr(trt.BuilderFlag, 'BF16'):
                     config.set_flag(trt.BuilderFlag.BF16)
                     print("[RFDETRNano] Using BF16 precision")
-                elif builder.platform_has_fast_fp16:
+                elif self.trt_precision == "bf16":
                     config.set_flag(trt.BuilderFlag.FP16)
                     print("[RFDETRNano] BF16 not available, using FP16 precision")
+                else:
+                    config.set_flag(trt.BuilderFlag.FP16)
+                    print("[RFDETRNano] Using FP16 precision")
 
             # Set optimization profile for static batch size
             profile = builder.create_optimization_profile()
