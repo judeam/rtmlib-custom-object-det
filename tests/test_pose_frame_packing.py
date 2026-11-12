@@ -23,13 +23,16 @@ class _StubPose(RTMPose):
         self.executions = []
         self.seen_pairs = []
 
-    def _infer_flat_crops(self, images, frame_ids, bboxes):
+    def _launch_flat_crops(self, images, frame_ids, bboxes):
         # One execution per engine-batch of crops, not one per frame.
         self.executions.append(
             (len(bboxes) + self.batch_size - 1) // self.batch_size
         )
         self.seen_pairs.append(list(zip(frame_ids, [tuple(b) for b in bboxes])))
-        n = len(bboxes)
+        return len(bboxes)
+
+    def _finish_flat_crops(self, launched):
+        n = launched
         keypoints = np.stack([
             np.full((26, 2), float(i), dtype=np.float32) for i in range(n)
         ])
@@ -117,3 +120,32 @@ def test_mismatched_lengths_are_rejected():
     pose = _StubPose()
     with pytest.raises(ValueError, match="same length"):
         pose.predict_frames([np.zeros((4, 4, 3), dtype=np.uint8)], [[], []])
+
+
+def test_launch_then_result_is_predict_frames():
+    pose = _StubPose(batch_size=8)
+    images = [np.zeros((32, 32, 3), dtype=np.uint8) for _ in range(3)]
+    bboxes = [[_box(0)], [_box(1), _box(2)], []]
+
+    pending = pose.predict_frames_launch(images, bboxes)
+    # Queued, not finished: the engine has run, the keypoints are not decoded.
+    assert pose.executions == [1]
+    launched = pending.result()
+    again = pending.result()
+
+    expected = _StubPose(batch_size=8).predict_frames(images, bboxes)
+    assert launched is again
+    for (kp, sc), (ekp, esc) in zip(launched, expected):
+        assert np.array_equal(kp, ekp) and np.array_equal(sc, esc)
+
+
+def test_launch_without_tensorrt_computes_at_once():
+    pose = _StubPose(batch_size=8, trt=False)
+    pose.__class__ = type("NoTrt", (_StubPose,), {
+        "__call__": lambda self, img, bboxes=None: ("per-frame", len(bboxes)),
+    })
+    images = [np.zeros((8, 8, 3), dtype=np.uint8) for _ in range(2)]
+
+    pending = pose.predict_frames_launch(images, [[_box(0)], []])
+
+    assert pending.result() == [("per-frame", 1), ("per-frame", 0)]

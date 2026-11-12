@@ -2,12 +2,34 @@ from typing import List, Tuple, Optional
 import os
 from pathlib import Path
 
+import cv2
 import numpy as np
 
 from ..base import BaseTool
 from ..file import download_checkpoint
 from .post_processings import convert_coco_to_openpose, get_simcc_maximum
 from .pre_processings import bbox_xyxy2cs, top_down_affine, get_warp_matrix
+
+
+class PendingPose:
+    """Pose results whose engine runs and read-backs are queued, not finished."""
+
+    def __init__(self, model, results, frame_ids=None, launched=None,
+                 num_frames=0):
+        self._model = model
+        self._results = results
+        self._frame_ids = frame_ids
+        self._launched = launched
+        self._num_frames = num_frames
+
+    def result(self):
+        if self._launched is not None:
+            model = self._model
+            keypoints, scores = model._finish_flat_crops(self._launched)
+            model._scatter_results(self._results, self._frame_ids,
+                                   keypoints, scores, self._num_frames)
+            self._launched = self._model = self._frame_ids = None
+        return self._results
 
 
 class RTMPose(BaseTool):
@@ -555,6 +577,18 @@ class RTMPose(BaseTool):
             List of ``(keypoints, scores)``, one entry per input frame, in
             input order. Frames with no boxes yield the empty arrays.
         """
+        return self.predict_frames_launch(images, bboxes_per_image).result()
+
+    def predict_frames_launch(self, images: list, bboxes_per_image: list):
+        """Queue ``predict_frames`` on the current stream without waiting.
+
+        Crop preprocessing, the engine runs and the read-back of the SimCC
+        outputs (asynchronous, into pinned memory) are queued behind whatever
+        the stream already holds. ``.result()`` on the returned object waits
+        for them and decodes the keypoints, giving exactly what
+        ``predict_frames`` returns. The frames are only read by work queued
+        here, so they may be released once that work has run.
+        """
         if len(images) != len(bboxes_per_image):
             raise ValueError(
                 f"images ({len(images)}) and bboxes_per_image "
@@ -562,8 +596,10 @@ class RTMPose(BaseTool):
             )
 
         if self._trt_engine is None:
-            return [self(img, bboxes=bb)
-                    for img, bb in zip(images, bboxes_per_image)]
+            return PendingPose(self, results=[
+                self(img, bboxes=bb)
+                for img, bb in zip(images, bboxes_per_image)
+            ])
 
         # Flatten to (frame index, bbox) pairs. Frames with no detections take
         # no engine slot at all; they are refilled with empties at the end.
@@ -578,15 +614,15 @@ class RTMPose(BaseTool):
             for _ in images
         ]
         if not flat_bboxes:
-            return results
+            return PendingPose(self, results=results)
 
-        keypoints, scores = self._infer_flat_crops(
-            images, frame_ids, flat_bboxes
-        )
+        launched = self._launch_flat_crops(images, frame_ids, flat_bboxes)
+        return PendingPose(self, results=results, frame_ids=frame_ids,
+                           launched=launched, num_frames=len(images))
 
-        # Scatter back: contiguous runs of one frame id, since frame_ids was
-        # built in frame order.
-        for frame_id in range(len(images)):
+    def _scatter_results(self, results, frame_ids, keypoints, scores, num_frames):
+        """Scatter crop results back to their frames, in frame order."""
+        for frame_id in range(num_frames):
             rows = [i for i, f in enumerate(frame_ids) if f == frame_id]
             if not rows:
                 continue
@@ -597,11 +633,21 @@ class RTMPose(BaseTool):
                     person_kpts, person_scores
                 )
             results[frame_id] = (person_kpts, person_scores)
-
         return results
 
     def _infer_flat_crops(self, images: list, frame_ids: list, bboxes: list):
         """Run every (frame, bbox) crop through the engine, batch-packed."""
+        return self._finish_flat_crops(
+            self._launch_flat_crops(images, frame_ids, bboxes)
+        )
+
+    def _launch_flat_crops(self, images: list, frame_ids: list, bboxes: list):
+        """Queue every (frame, bbox) crop through the engine, batch-packed.
+
+        Returns what ``_finish_flat_crops`` needs: the pinned host staging
+        for the SimCC outputs, an event recorded behind the last copy, and
+        the crop geometry.
+        """
         import torch
 
         batch_tensor, centers, scales = self._preprocess_batch_multi(
@@ -609,7 +655,18 @@ class RTMPose(BaseTool):
         )
 
         num_crops = len(bboxes)
-        all_simcc_x, all_simcc_y = [], []
+        output_names = list(self._trt_output_tensors.keys())
+        out_x = self._trt_output_tensors[output_names[0]]
+        out_y = self._trt_output_tensors[output_names[1]]
+        # Host staging for the whole call, filled with asynchronous copies as
+        # each chunk finishes; the host waits on one event at the end instead
+        # of after every chunk's two read-backs.
+        simcc_x = torch.empty(
+            (num_crops,) + tuple(out_x.shape[1:]), dtype=out_x.dtype, pin_memory=True
+        )
+        simcc_y = torch.empty(
+            (num_crops,) + tuple(out_y.shape[1:]), dtype=out_y.dtype, pin_memory=True
+        )
 
         for chunk_start in range(0, num_crops, self.batch_size):
             chunk_end = min(chunk_start + self.batch_size, num_crops)
@@ -637,20 +694,20 @@ class RTMPose(BaseTool):
                 )
                 self._trt_stream.synchronize()
 
-            output_names = list(self._trt_output_tensors.keys())
-            all_simcc_x.append(
-                self._trt_output_tensors[output_names[0]][:chunk_size]
-                .cpu().numpy()
-            )
-            all_simcc_y.append(
-                self._trt_output_tensors[output_names[1]][:chunk_size]
-                .cpu().numpy()
-            )
+            simcc_x[chunk_start:chunk_end].copy_(out_x[:chunk_size], non_blocking=True)
+            simcc_y[chunk_start:chunk_end].copy_(out_y[:chunk_size], non_blocking=True)
 
-        simcc_x = np.concatenate(all_simcc_x, axis=0)
-        simcc_y = np.concatenate(all_simcc_y, axis=0)
+        event = torch.cuda.Event()
+        event.record()
+        return simcc_x, simcc_y, event, centers, scales
 
-        return self._postprocess_batch(simcc_x, simcc_y, centers, scales)
+    def _finish_flat_crops(self, launched):
+        """Wait for a launched crop batch and decode its keypoints."""
+        simcc_x, simcc_y, event, centers, scales = launched
+        event.synchronize()
+        return self._postprocess_batch(
+            simcc_x.numpy(), simcc_y.numpy(), centers, scales
+        )
 
     def _preprocess_batch_multi(self, images: list, frame_ids: list,
                                 bboxes: list):
@@ -659,8 +716,13 @@ class RTMPose(BaseTool):
         Identical arithmetic to the single-image version -- same warp matrix,
         same bilinear ``grid_sample``, same normalisation -- differing only in
         that each crop samples the frame it came from instead of one shared
-        image. Every frame in a decode batch has the same resolution, so the
-        source images stack into one tensor.
+        image. Every frame in a decode batch has the same resolution.
+
+        Only the part of each frame a crop can read is converted to fp32: the
+        sampler is handed a full-size fp32 plane per frame, but just the window
+        around that frame's crops (plus a margin for the bilinear taps) is
+        written into it. Everything the sampler reads has the value a full
+        conversion would give it; the rest of the plane is never read.
         """
         import torch
         import torch.nn.functional as F
@@ -674,26 +736,34 @@ class RTMPose(BaseTool):
         centers, scales = self._compute_centers_scales_batch(
             bboxes_arr, aspect_ratio
         )
+        thetas = self._warp_thetas(centers, scales, src_w, src_h, w, h)
 
-        thetas = np.zeros((num_crops, 2, 3), dtype=np.float32)
-        for i in range(num_crops):
-            warp_mat = get_warp_matrix(
-                centers[i], scales[i], 0, output_size=(w, h)
-            )
-            thetas[i] = self._warp_mat_to_theta(warp_mat, src_w, src_h, w, h)
-
-        # Upload each distinct frame once, then index it per crop, so a frame
-        # holding several people is still only transferred a single time.
         used_ids = sorted(set(frame_ids))
-        uploaded = torch.stack([
-            self._as_gpu_chw(images[frame_id]) for frame_id in used_ids
-        ])
         row_of = {frame_id: row for row, frame_id in enumerate(used_ids)}
-        select = torch.as_tensor(
-            [row_of[frame_id] for frame_id in frame_ids],
-            device=uploaded.device, dtype=torch.long,
-        )
-        img_batch = uploaded.index_select(0, select)
+        windows = self._source_windows(thetas, frame_ids, used_ids, src_w, src_h, w, h)
+
+        planes = self._crop_planes(len(used_ids), src_h, src_w)
+        for row, frame_id in enumerate(used_ids):
+            x0, y0, x1, y1 = windows[row]
+            if x1 <= x0 or y1 <= y0:
+                continue
+            image = images[frame_id]
+            if not isinstance(image, torch.Tensor):
+                image = torch.from_numpy(image)
+            if not image.is_cuda:
+                image = image.cuda(non_blocking=True)
+            planes[row, :, y0:y1, x0:x1].copy_(
+                image[y0:y1, x0:x1].permute(2, 0, 1)
+            )
+
+        select_rows = [row_of[frame_id] for frame_id in frame_ids]
+        if select_rows == list(range(len(used_ids))):
+            img_batch = planes[:len(used_ids)]
+        else:
+            select = torch.as_tensor(
+                select_rows, device=planes.device, dtype=torch.long,
+            )
+            img_batch = planes[:len(used_ids)].index_select(0, select)
 
         theta_tensor = torch.from_numpy(thetas).cuda()
         grid = F.affine_grid(
@@ -705,6 +775,111 @@ class RTMPose(BaseTool):
         warped = warped.sub_(self._gpu_norm_mean).div_(self._gpu_norm_std)
 
         return warped, centers, scales
+
+    def _crop_planes(self, rows: int, src_h: int, src_w: int):
+        """Reusable fp32 CHW staging planes, at least ``rows`` of them."""
+        import torch
+
+        planes = self.__dict__.get("_crop_plane_buf")
+        if (planes is None or planes.shape[0] < rows
+                or planes.shape[2:] != (src_h, src_w)):
+            planes = torch.empty(
+                (max(rows, 1), 3, src_h, src_w),
+                dtype=torch.float32, device='cuda',
+            )
+            self._crop_plane_buf = planes
+        return planes
+
+    def _warp_thetas(self, centers: np.ndarray, scales: np.ndarray,
+                     src_w: int, src_h: int, dst_w: int, dst_h: int):
+        """``_warp_mat_to_theta(get_warp_matrix(...))`` for every crop at once.
+
+        The same float32 point arithmetic as ``get_warp_matrix`` (rotation 0,
+        no shift), the same ``cv2.getAffineTransform`` per crop (the only
+        per-crop call left), and the matrix inversion and theta algebra done
+        over the whole stack in the same operation order and precision.
+        """
+        n = len(centers)
+        src = np.zeros((n, 3, 2), dtype=np.float32)
+        shift = np.array((0., 0.))
+        src_dir = np.zeros((n, 2))
+        src_dir[:, 1] = scales[:, 0] * -0.5
+        src[:, 0, :] = centers + scales * shift
+        src[:, 1, :] = centers + src_dir + scales * shift
+        direction = src[:, 0, :] - src[:, 1, :]
+        src[:, 2, :] = src[:, 1, :] + np.stack(
+            [-direction[:, 1], direction[:, 0]], axis=1
+        )
+
+        dst = np.zeros((3, 2), dtype=np.float32)
+        dst[0, :] = [dst_w * 0.5, dst_h * 0.5]
+        dst_dir = np.array([0., dst_w * -0.5])
+        dst[1, :] = np.array([dst_w * 0.5, dst_h * 0.5]) + dst_dir
+        direction = dst[0, :] - dst[1, :]
+        dst[2, :] = dst[1, :] + np.r_[-direction[1], direction[0]]
+
+        M = np.zeros((n, 3, 3))
+        M[:, 2, 2] = 1
+        for i in range(n):
+            M[i, :2, :] = cv2.getAffineTransform(src[i], dst)
+        M_inv = np.linalg.inv(M)[:, :2]
+
+        theta = np.zeros((n, 2, 3), dtype=np.float32)
+        theta[:, 0, 0] = M_inv[:, 0, 0] * dst_w / src_w
+        theta[:, 0, 1] = M_inv[:, 0, 1] * dst_h / src_w
+        theta[:, 0, 2] = (M_inv[:, 0, 0] * (dst_w - 1)
+                          + M_inv[:, 0, 1] * (dst_h - 1)
+                          + 2 * M_inv[:, 0, 2] + 1) / src_w - 1
+        theta[:, 1, 0] = M_inv[:, 1, 0] * dst_w / src_h
+        theta[:, 1, 1] = M_inv[:, 1, 1] * dst_h / src_h
+        theta[:, 1, 2] = (M_inv[:, 1, 0] * (dst_w - 1)
+                          + M_inv[:, 1, 1] * (dst_h - 1)
+                          + 2 * M_inv[:, 1, 2] + 1) / src_h - 1
+        return theta
+
+    @staticmethod
+    def _source_windows(thetas: np.ndarray, frame_ids: list, used_ids: list,
+                        src_w: int, src_h: int, dst_w: int, dst_h: int,
+                        margin: int = 3):
+        """Per used frame, the (x0, y0, x1, y1) pixel window its crops sample.
+
+        Taken from the affine map itself (the extreme output corners, which an
+        affine map sends to the extremes of the sampled region), widened by
+        ``margin`` pixels for the bilinear taps. Frames whose map is not finite
+        get the whole frame.
+        """
+        corners = np.array(
+            [[-1 + 1 / dst_w, -1 + 1 / dst_h, 1],
+             [1 - 1 / dst_w, -1 + 1 / dst_h, 1],
+             [-1 + 1 / dst_w, 1 - 1 / dst_h, 1],
+             [1 - 1 / dst_w, 1 - 1 / dst_h, 1]], dtype=np.float64
+        )
+        norm = np.einsum('nij,kj->nki', thetas.astype(np.float64), corners)
+        px = ((norm[:, :, 0] + 1) * src_w - 1) / 2
+        py = ((norm[:, :, 1] + 1) * src_h - 1) / 2
+        lo_x, hi_x = px.min(axis=1), px.max(axis=1)
+        lo_y, hi_y = py.min(axis=1), py.max(axis=1)
+
+        row_of = {frame_id: row for row, frame_id in enumerate(used_ids)}
+        full = (0, 0, src_w, src_h)
+        windows = [None] * len(used_ids)
+        for crop, frame_id in enumerate(frame_ids):
+            row = row_of[frame_id]
+            vals = (lo_x[crop], hi_x[crop], lo_y[crop], hi_y[crop])
+            if not np.all(np.isfinite(vals)):
+                windows[row] = full
+                continue
+            x0 = int(np.clip(np.floor(vals[0]) - margin, 0, src_w))
+            x1 = int(np.clip(np.ceil(vals[1]) + margin + 1, 0, src_w))
+            y0 = int(np.clip(np.floor(vals[2]) - margin, 0, src_h))
+            y1 = int(np.clip(np.ceil(vals[3]) + margin + 1, 0, src_h))
+            old = windows[row]
+            if old is None:
+                windows[row] = (x0, y0, x1, y1)
+            elif old != full:
+                windows[row] = (min(old[0], x0), min(old[1], y0),
+                                max(old[2], x1), max(old[3], y1))
+        return windows
 
     def _as_gpu_chw(self, image):
         """A single frame as a float CHW CUDA tensor, uploading only if needed.

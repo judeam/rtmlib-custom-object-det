@@ -13,6 +13,27 @@ from pathlib import Path
 from ..base import BaseTool
 
 
+class PendingDetections:
+    """Detections whose device-to-host copy is queued but may not have run."""
+
+    def __init__(self, detector, host=None, event=None, results=None):
+        self._detector = detector
+        self._host = host
+        self._event = event
+        self._results = results
+
+    @classmethod
+    def ready(cls, results):
+        return cls(None, results=results)
+
+    def result(self) -> List[np.ndarray]:
+        if self._results is None:
+            self._event.synchronize()
+            self._results = self._detector._detections_from_host(self._host.numpy())
+            self._host = self._event = self._detector = None
+        return self._results
+
+
 class RFDETRNano(BaseTool):
     """RFDETRNano object detector with person filtering and TensorRT engine support.
 
@@ -25,6 +46,10 @@ class RFDETRNano(BaseTool):
     _EMPTY_BOXES = np.array([], dtype=np.float32).reshape(0, 5)  # Pre-allocated empty result
     _DEDUP_IOU_THR = 0.9  # Drop boxes overlapping a higher-scoring box above this IoU
     _MIN_BOX_AREA = 4.0  # Minimum box area in px^2 (sanity filter)
+    # Precisions the TensorRT engine can be built at. bf16 is the default and
+    # what the deployed engines are; RFDETR_NANO_TRT_PRECISION picks another.
+    _TRT_PRECISIONS = ("bf16", "fp16", "fp32")
+    trt_precision = "bf16"
 
     def __init__(
         self,
@@ -36,6 +61,7 @@ class RFDETRNano(BaseTool):
         export_format: str = 'engine',
         batch_size: int = 1,
         use_cuda_graphs: bool = True,
+        trt_precision: Optional[str] = None,
     ):
         """Initialize RFDETRNano detector.
 
@@ -48,6 +74,9 @@ class RFDETRNano(BaseTool):
             export_format: Format for export ('engine' for TensorRT, 'onnx' for ONNX).
             batch_size: Batch size for TensorRT inference (default: 1).
             use_cuda_graphs: Whether to use CUDA Graphs for faster inference (default: True).
+            trt_precision: 'bf16', 'fp16' or 'fp32' for the TensorRT engine. None reads
+                RFDETR_NANO_TRT_PRECISION and falls back to 'bf16'. Each precision has
+                its own engine file. The boxes differ slightly between them.
         """
         self.model_input_size = model_input_size
         self.score_thr = score_thr
@@ -56,6 +85,7 @@ class RFDETRNano(BaseTool):
         self.export_format = export_format
         self.batch_size = batch_size
         self.use_cuda_graphs = use_cuda_graphs
+        self.trt_precision = self._resolve_trt_precision(trt_precision)
         self.model = None
         self.engine_path = None
         self._engine = None
@@ -244,17 +274,31 @@ class RFDETRNano(BaseTool):
                 "rfdetr package not installed. Please install with: pip install rfdetr"
             )
 
-    def _get_or_build_engine(self) -> Optional[str]:
-        """Get existing TensorRT engine or build a new one."""
-        # Generate engine path based on model and config
+    @classmethod
+    def _resolve_trt_precision(cls, requested: Optional[str]) -> str:
+        """The engine precision: the argument, else RFDETR_NANO_TRT_PRECISION, else bf16."""
+        value = requested or os.environ.get("RFDETR_NANO_TRT_PRECISION") or "bf16"
+        value = value.strip().lower()
+        if value not in cls._TRT_PRECISIONS:
+            raise ValueError(
+                f"TensorRT precision {value!r} is not one of {', '.join(cls._TRT_PRECISIONS)}"
+            )
+        return value
+
+    def _engine_name(self) -> str:
+        """Engine file name: model, input size, batch size and precision.
+
+        The precision is part of the name, so engines built at different
+        precisions sit side by side and one is never loaded for another.
+        """
         model_stem = Path(self.model_path).stem
         size_str = f"{self.model_input_size[0]}x{self.model_input_size[1]}"
-        # Use BF16 for better dynamic range than FP16
-        precision_str = "bf16" if self.device == 'cuda' else "fp32"
+        precision_str = self.trt_precision if self.device == 'cuda' else "fp32"
+        return f"{model_stem}_{size_str}_b{self.batch_size}_cuda_{precision_str}.engine"
 
-        # Include batch size in engine filename for caching different configurations
-        engine_name = f"{model_stem}_{size_str}_b{self.batch_size}_cuda_{precision_str}.engine"
-        engine_path = str(Path(self.model_path).parent / engine_name)
+    def _get_or_build_engine(self) -> Optional[str]:
+        """Get existing TensorRT engine or build a new one."""
+        engine_path = str(Path(self.model_path).parent / self._engine_name())
 
         print(f"[RFDETRNano] Checking for engine at: {engine_path}")
         print(f"[RFDETRNano] Engine exists: {os.path.exists(engine_path)}")
@@ -283,18 +327,19 @@ class RFDETRNano(BaseTool):
         git+https://github.com/jude-mingay-bps/rf-detr-tensorrt-batch.git
         """
         try:
-            # Load PyTorch model if not already loaded
-            if self.model is None:
-                self._load_pytorch_model()
-
             model_stem = Path(self.model_path).stem
             # Include batch size in ONNX filename for caching different configurations
             onnx_path = str(Path(self.model_path).parent / f"{model_stem}_b{self.batch_size}.onnx")
 
-            # Check if ONNX already exists
+            # An ONNX that is already there is used as it is: the checkpoint is
+            # not loaded to rebuild an engine (another precision, a new GPU).
             if os.path.exists(onnx_path):
                 print(f"ONNX model already exists: {onnx_path}")
                 return onnx_path
+
+            # Load PyTorch model if not already loaded
+            if self.model is None:
+                self._load_pytorch_model()
 
             print(f"Exporting to ONNX with batch_size={self.batch_size}: {onnx_path}")
 
@@ -373,7 +418,7 @@ class RFDETRNano(BaseTool):
             return None
 
     def _build_tensorrt_engine(self, onnx_path: str, engine_path: str) -> Optional[str]:
-        """Build TensorRT engine from ONNX model with BF16 precision."""
+        """Build TensorRT engine from ONNX model at ``self.trt_precision``."""
         try:
             import tensorrt as trt
 
@@ -397,15 +442,19 @@ class RFDETRNano(BaseTool):
             config = builder.create_builder_config()
             config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 4 * (1 << 30))  # 4GB
 
-            # Enable BF16 for CUDA (better dynamic range than FP16)
-            # Fall back to FP16 if BF16 not available
-            if self.device == 'cuda':
-                if hasattr(trt.BuilderFlag, 'BF16') and builder.platform_has_fast_fp16:
+            # Reduced precision on CUDA: bf16 unless another was asked for,
+            # fp16 where this TensorRT has no bf16. fp32 sets no flag.
+            if self.device == 'cuda' and self.trt_precision != "fp32" \
+                    and builder.platform_has_fast_fp16:
+                if self.trt_precision == "bf16" and hasattr(trt.BuilderFlag, 'BF16'):
                     config.set_flag(trt.BuilderFlag.BF16)
                     print("[RFDETRNano] Using BF16 precision")
-                elif builder.platform_has_fast_fp16:
+                elif self.trt_precision == "bf16":
                     config.set_flag(trt.BuilderFlag.FP16)
                     print("[RFDETRNano] BF16 not available, using FP16 precision")
+                else:
+                    config.set_flag(trt.BuilderFlag.FP16)
+                    print("[RFDETRNano] Using FP16 precision")
 
             # Set optimization profile for static batch size
             profile = builder.create_optimization_profile()
@@ -473,6 +522,9 @@ class RFDETRNano(BaseTool):
 
             # Pre-compute normalization constants (avoid allocation each inference)
             self._norm_mean = torch.tensor([0.485, 0.456, 0.406], device="cuda").view(1, 3, 1, 1)
+            # BGR -> RGB channel order, resident on the device (see
+            # _preprocess_batch_for_tensorrt).
+            self._bgr_to_rgb = torch.tensor([2, 1, 0], device="cuda")
             self._norm_std = torch.tensor([0.229, 0.224, 0.225], device="cuda").view(1, 3, 1, 1)
 
             # Set up CUDA graph for faster kernel replay
@@ -855,41 +907,41 @@ class RFDETRNano(BaseTool):
         batch_size = len(frames)
         frame_h, frame_w = frames[0].shape[:2]
 
-        # Use pre-allocated GPU buffer (avoid allocation per batch)
+        # One fp32 staging buffer, filled straight from the frames: the uint8
+        # copy of every frame that used to sit in between (and the fp32 copy
+        # made from it) is gone. Laid out NCHW, like the tensor the channel
+        # swap used to hand to the resize, so the resize runs the same kernel.
         buffer_key = (batch_size, frame_h, frame_w)
         if buffer_key not in self._preprocess_buffers:
             self._preprocess_buffers[buffer_key] = torch.empty(
-                (batch_size, frame_h, frame_w, 3),
-                dtype=torch.uint8,
+                (batch_size, 3, frame_h, frame_w),
+                dtype=torch.float32,
                 device='cuda'
             )
             print(f"[RFDETRNano] Allocated preprocess buffer: {buffer_key}")
 
         gpu_buffer = self._preprocess_buffers[buffer_key]
 
-        # Fast path: copy frames directly to GPU (avoids numpy.stack bottleneck).
         # A frame that is already a CUDA tensor -- which is what an NVDEC
-        # decode loop holds -- is copied device to device, so the caller does
+        # decode loop holds -- is converted device to device, so the caller does
         # not have to stage it through host memory to hand it back.
         for i, frame in enumerate(frames):
             if isinstance(frame, torch.Tensor):
-                gpu_buffer[i].copy_(frame, non_blocking=True)
+                gpu_buffer[i].copy_(frame.permute(2, 0, 1), non_blocking=True)
                 continue
             # Check contiguous to avoid unnecessary copy
             if not frame.flags['C_CONTIGUOUS']:
                 frame = np.ascontiguousarray(frame)
             gpu_buffer[i].copy_(
-                torch.from_numpy(frame),
+                torch.from_numpy(frame).permute(2, 0, 1),
                 non_blocking=True
             )
 
-        # Convert to float and reorder dimensions on GPU: (B, H, W, C) -> (B, C, H, W)
-        batch_tensor = gpu_buffer[:batch_size].permute(0, 3, 1, 2).float()
+        batch_tensor = gpu_buffer
 
-        # BGR→RGB channel swap on GPU (faster than CPU cv2.cvtColor)
-        batch_tensor = batch_tensor[:, [2, 1, 0], :, :]
-
-        # Resize on GPU if needed
+        # Resize on GPU if needed. Interpolation treats channels independently,
+        # so it runs on the BGR planes and the channel swap below touches the
+        # small 384x384 result instead of the full-resolution frames.
         if frame_h != resolution or frame_w != resolution:
             batch_tensor = F.interpolate(
                 batch_tensor,
@@ -897,6 +949,13 @@ class RFDETRNano(BaseTool):
                 mode="bilinear",
                 align_corners=False,
             )
+
+        # BGR->RGB channel swap on GPU
+        # Indexing with a Python list uploads the list from pageable host
+        # memory on every call, and that upload waits for all work already
+        # queued on the stream: here, the previous chunk's engine run. The
+        # index tensor lives on the device instead. Same gather, same values.
+        batch_tensor = batch_tensor.index_select(1, self._bgr_to_rgb)
 
         # Fused normalize on GPU: [0-255] -> [0-1] -> ImageNet normalized
         batch_tensor = batch_tensor.mul_(1.0 / 255.0)
@@ -939,7 +998,32 @@ class RFDETRNano(BaseTool):
         frames: List[np.ndarray],
         threshold: Optional[float] = None,
     ) -> List[np.ndarray]:
-        """Run batch inference using TensorRT engine with CUDA Graphs.
+        """Run batch inference and wait for the detections."""
+        return self._launch_tensorrt_batch(frames, threshold).result()
+
+    def predict_batch_launch(
+        self,
+        frames: List[np.ndarray],
+        threshold: Optional[float] = None,
+    ) -> "PendingDetections":
+        """Queue batch detection on the current stream without waiting for it.
+
+        ``.result()`` on the returned object waits for the batch and gives
+        what ``predict_batch`` returns. Between the two the host is free to
+        queue more GPU work. The frames must stay alive until the queued work
+        has read them (keep them referenced, or order the stream that frees
+        them behind the current one).
+        """
+        if self.backend == 'pytorch' or self._engine is None:
+            return PendingDetections.ready(self.predict_batch(frames, threshold))
+        return self._launch_tensorrt_batch(frames, threshold)
+
+    def _launch_tensorrt_batch(
+        self,
+        frames: List[np.ndarray],
+        threshold: Optional[float] = None,
+    ) -> "PendingDetections":
+        """Queue batch inference using TensorRT engine with CUDA Graphs.
 
         Key optimizations:
         - CUDA Graph replay (no explicit sync needed)
@@ -965,7 +1049,7 @@ class RFDETRNano(BaseTool):
         actual_batch = len(frames)
         engine_batch = self.batch_size
 
-        all_results = []
+        packed = []
 
         # Process in chunks matching engine batch size
         for chunk_start in range(0, actual_batch, engine_batch):
@@ -998,7 +1082,9 @@ class RFDETRNano(BaseTool):
                     )
                 self._stream.synchronize()
 
-            # Parse outputs using zero-copy views (narrow())
+            # Parse outputs using zero-copy views (narrow()) and reduce them
+            # on the GPU right away: the next chunk's execution overwrites the
+            # engine's output buffers. Nothing is sent to the host yet.
             actual_count = len(chunk_frames)
             boxes = self._output_tensors[self._boxes_name].narrow(0, 0, actual_count)
             scores = (
@@ -1006,14 +1092,19 @@ class RFDETRNano(BaseTool):
                 if self._scores_name
                 else None
             )
-
-            # Postprocess on GPU, then transfer
-            chunk_results = self._postprocess_tensorrt_batch(
-                boxes, scores, chunk_sizes, threshold
+            packed.append(
+                self._reduce_detections_gpu(boxes, scores, chunk_sizes, threshold)
             )
-            all_results.extend(chunk_results)
 
-        return all_results
+        # One transfer for the whole frame batch, into pinned memory behind
+        # the batch's kernels; the host waits on an event (which does not hold
+        # the interpreter lock) when it needs the boxes.
+        dev = packed[0] if len(packed) == 1 else torch.cat(packed, dim=0)
+        host = torch.empty(dev.shape, dtype=dev.dtype, pin_memory=True)
+        host.copy_(dev, non_blocking=True)
+        event = torch.cuda.Event()
+        event.record()
+        return PendingDetections(self, host, event)
 
     def _postprocess_tensorrt_batch(
         self,
@@ -1041,7 +1132,44 @@ class RFDETRNano(BaseTool):
         """
         import torch
 
-        num_frames = len(frame_sizes)
+        host = self._reduce_detections_gpu(
+            boxes, scores, frame_sizes, threshold
+        ).cpu().numpy()
+        return self._detections_from_host(host)
+
+    def _frame_sizes_tensor(self, frame_sizes: List[Tuple[int, int]]) -> "torch.Tensor":
+        """Frame sizes as a CUDA tensor, uploaded once per distinct size list.
+
+        Building it per chunk is a pageable host-to-device copy, which waits
+        for everything queued on the stream before it.
+        """
+        import torch
+
+        cache = self.__dict__.setdefault("_frame_size_cache", {})
+        key = tuple(frame_sizes)
+        tensor = cache.get(key)
+        if tensor is None:
+            if len(cache) >= 8:
+                cache.clear()
+            tensor = torch.as_tensor(frame_sizes, device="cuda", dtype=torch.float32)
+            cache[key] = tensor
+        return tensor
+
+    def _reduce_detections_gpu(
+        self,
+        boxes: "torch.Tensor",
+        scores: "torch.Tensor",
+        frame_sizes: List[Tuple[int, int]],
+        threshold: float,
+    ) -> "torch.Tensor":
+        """Per-query boxes, score and validity as one (frames, queries, 6) tensor.
+
+        Columns 0-3 are xyxy in pixels, 4 the best class score, 5 is 1.0 where
+        the query is a person above ``threshold``. Everything is float32 and
+        exact (a 0/1 flag), so packing changes no value; it lets the whole
+        batch come back in a single device-to-host copy.
+        """
+        import torch
 
         # Apply sigmoid to all scores at once (GPU)
         if scores is not None:
@@ -1053,11 +1181,9 @@ class RFDETRNano(BaseTool):
                 boxes.shape[0], boxes.shape[1], device="cuda", dtype=torch.int64
             )
 
-        # Filter on GPU before CPU transfer - only transfer valid detections
         valid_mask = (max_scores >= threshold) & (class_ids == self.PERSON_CLASS)
 
-        # Create frame sizes tensor for vectorized scaling
-        frame_sizes_t = torch.as_tensor(frame_sizes, device="cuda", dtype=torch.float32)
+        frame_sizes_t = self._frame_sizes_tensor(frame_sizes)
         orig_w = frame_sizes_t[:, 0:1]  # (num_frames, 1)
         orig_h = frame_sizes_t[:, 1:2]  # (num_frames, 1)
 
@@ -1067,25 +1193,26 @@ class RFDETRNano(BaseTool):
         cx = boxes[:, :, 0]
         cy = boxes[:, :, 1]
 
-        # Scale and stack - vectorized for all frames
-        boxes_xyxy = torch.stack(
+        return torch.stack(
             [
                 (cx - half_w) * orig_w,
                 (cy - half_h) * orig_h,
                 (cx + half_w) * orig_w,
                 (cy + half_h) * orig_h,
+                max_scores,
+                valid_mask.to(torch.float32),
             ],
             dim=2,
-        )  # (num_frames, 300, 4)
+        )
 
-        # Single batched CPU transfer - .cpu() implicitly syncs with GPU
-        boxes_cpu = boxes_xyxy.cpu().numpy()
-        scores_cpu = max_scores.cpu().numpy()
-        valid_cpu = valid_mask.cpu().numpy()
+    def _detections_from_host(self, host: np.ndarray) -> List[np.ndarray]:
+        """Per-frame (N, 5) detections from the packed host array."""
+        boxes_cpu = host[:, :, :4]
+        scores_cpu = host[:, :, 4]
+        valid_cpu = host[:, :, 5] > 0.5
 
-        # Create results per frame using pre-computed GPU filter mask
         results = []
-        for batch_idx in range(num_frames):
+        for batch_idx in range(host.shape[0]):
             valid_indices = np.nonzero(valid_cpu[batch_idx])[0]
             if len(valid_indices) == 0:
                 results.append(self._EMPTY_BOXES)
